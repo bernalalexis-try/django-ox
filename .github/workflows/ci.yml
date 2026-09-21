@@ -235,6 +235,52 @@ jobs:
         env:
           DJANGO_SETTINGS_MODULE: tests.settings_postgres
 
+  # Wagtail queues a search-index update through django_tasks.task on every
+  # save of an indexed model. The suite never drives a real Wagtail project, so
+  # "publish a page, the worker indexes it" was a claim rather than a fact.
+  # tools/wagtail_smoke.py publishes a page in a fresh `wagtail start` project on
+  # SQLite and requires the update to wait in the queue, run through ox_worker,
+  # and turn up in search.
+  #
+  # Two legs, one per task path. Wagtail imports django_tasks on both: on 5.2
+  # it is the backport django_ox.compat targets, on 6.1 its decorator hands
+  # task construction to the configured backend's task class.
+  #
+  # ==, not ranges: a Wagtail, Django or django-tasks release changes what this
+  # job runs only when a pin here is bumped.
+  wagtail-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.12"
+            django-version: "5.2.17"
+            wagtail-version: "7.4.3"
+            checkout-install: '-e ".[backport]"'
+          - python-version: "3.14"
+            django-version: "6.1.1"
+            wagtail-version: "8.0"
+            checkout-install: "-e ."
+    name: wagtail smoke py${{ matrix.python-version }} dj${{ matrix.django-version }} wagtail${{ matrix.wagtail-version }}
+    env:
+      PYTHONFAULTHANDLER: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: >-
+          python -m pip install ${{ matrix.checkout-install }}
+          "Django==${{ matrix.django-version }}"
+          "wagtail==${{ matrix.wagtail-version }}"
+          "django-tasks==0.12.0"
+      # Every wait inside the driver is bounded, and a failure prints the worker
+      # log, the task statuses and the active search backend.
+      - run: python tools/wagtail_smoke.py
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -299,7 +345,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [test-sqlite, test-postgres, test-postgres-naive, test-backport-floor, test-mysql, lint, types, docs, packaging]
+    needs: [test-sqlite, test-postgres, test-postgres-naive, test-backport-floor, wagtail-smoke, test-mysql, lint, types, docs, packaging]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
