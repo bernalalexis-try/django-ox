@@ -246,8 +246,10 @@ jobs:
   # it is the backport django_ox.compat targets, on 6.1 its decorator hands
   # task construction to the configured backend's task class.
   #
-  # ==, not ranges: a Wagtail, Django or django-tasks release changes what this
-  # job runs only when a pin here is bumped.
+  # ==, not ranges: a Wagtail, modelsearch, Django or django-tasks release
+  # changes what this job runs only when a pin here is bumped. modelsearch is
+  # Wagtail's search library: it defines the index-update task and the signal
+  # handler that queues it, so each leg pins it beside Wagtail.
   wagtail-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -258,10 +260,12 @@ jobs:
           - python-version: "3.12"
             django-version: "5.2.17"
             wagtail-version: "7.4.3"
+            modelsearch-version: "1.3.2"
             checkout-install: '-e ".[backport]"'
           - python-version: "3.14"
             django-version: "6.1.1"
             wagtail-version: "8.0"
+            modelsearch-version: "1.3.2"
             checkout-install: "-e ."
     name: wagtail smoke py${{ matrix.python-version }} dj${{ matrix.django-version }} wagtail${{ matrix.wagtail-version }}
     env:
@@ -278,6 +282,7 @@ jobs:
           python -m pip install ${{ matrix.checkout-install }}
           "Django==${{ matrix.django-version }}"
           "wagtail==${{ matrix.wagtail-version }}"
+          "modelsearch==${{ matrix.modelsearch-version }}"
           "django-tasks==0.12.0"
       # Every wait inside the driver is bounded, and a failure prints the worker
       # log, the task statuses and the active search backend.
