@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid
 from pathlib import Path
 from typing import IO
@@ -246,7 +247,7 @@ def smoke(root: Path, log: IO[bytes]) -> str:
     return f"{len(rows)} task(s) SUCCESSFUL, 1 search hit for {word!r}"
 
 
-def report(failure: SmokeFailure, log_path: Path) -> None:
+def report(failure: Exception, log_path: Path) -> None:
     print(f"wagtail smoke: FAILED: {failure}", file=sys.stderr)
     # Each of these can fail on its own, e.g. before Django is set up.
     try:
@@ -270,7 +271,9 @@ def main() -> int:
         with log_path.open("wb") as log:
             try:
                 summary = smoke(Path(tmp) / "site", log)
-            except SmokeFailure as failure:
+            except Exception as failure:
+                if not isinstance(failure, SmokeFailure):
+                    traceback.print_exc()
                 report(failure, log_path)
                 return 1
         print(f"wagtail smoke: ok: {summary}")
