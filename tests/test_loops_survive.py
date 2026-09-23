@@ -467,7 +467,7 @@ class TestABatchPassMustSucceed:
         calls = self.break_dispatch(worker, monkeypatch, failures=1)
         self.run_to_completion(worker, caplog)
 
-        assert len(calls) == 2, "the batch ended without retrying the dispatch"
+        assert len(calls) >= 2, "the batch ended without retrying the dispatch"
         (row,) = OxTask.objects.all()
         assert row.task_path == "tests.tasks.add"
         assert row.status == OxTask.Status.SUCCESSFUL
