@@ -978,11 +978,11 @@ class Worker:
         self.batch = batch
         self.max_tasks = max_tasks
         self._claimed = 0
-        # Set by the compare-and-set claim when it read candidates and lost
-        # every one of them to another claimer. That None means the queue
-        # was busy, not empty, and --batch must not end on it. run() clears
-        # it before each claim_one(), so an override that returns None
-        # without calling the base claim never inherits a stale one.
+        # Set when the compare-and-set claim read candidates but returned none,
+        # because every candidate lost its CAS or failed ownership read-back.
+        # That None does not establish an empty queue, so --batch polls again.
+        # run() clears it before each claim_one(), so an override that returns
+        # None without calling the base claim never inherits a stale one.
         self._claim_contended = False
         # Under a supervisor, the pid to watch: a worker whose supervisor has
         # gone (it was SIGKILLed, or died on a signal it could not forward)

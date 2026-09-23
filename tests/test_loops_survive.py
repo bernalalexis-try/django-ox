@@ -13,7 +13,7 @@ import threading
 import time
 
 import pytest
-from django.db import InterfaceError, OperationalError
+from django.db import DataError, InterfaceError, OperationalError
 from django.utils import timezone
 
 from django_ox.models import OxTask
@@ -388,10 +388,10 @@ class TestABatchPassMustSucceed:
         return worker
 
     @staticmethod
-    def break_dispatch(worker, monkeypatch, *, failures):
+    def break_dispatch(worker, monkeypatch, *, failures, error=OperationalError):
         """
-        Make the worker's first `failures` dispatches raise, or every one
-        when it is None. Returns the attempts, one entry each.
+        Make the worker's first `failures` dispatches raise `error`, or every
+        one when it is None. Returns the attempts, one entry each.
         """
         calls = []
         real_dispatch = worker.dispatch_schedules
@@ -399,7 +399,7 @@ class TestABatchPassMustSucceed:
         def dispatch():
             calls.append(1)
             if failures is None or len(calls) <= failures:
-                raise OperationalError("gone")
+                raise error("gone")
             return real_dispatch()
 
         monkeypatch.setattr(worker, "dispatch_schedules", dispatch)
@@ -474,11 +474,16 @@ class TestABatchPassMustSucceed:
         (done,) = events(caplog, "worker_batch_empty")
         assert done.claimed == 1
 
+    # DataError stands for a schedule the database rejects on every
+    # dispatch, which the job docs say holds the batch until its timeout.
+    @pytest.mark.parametrize("error", [OperationalError, DataError])
     @pytest.mark.django_db(transaction=True)
     def test_a_dispatch_that_keeps_failing_holds_the_batch_open(
-        self, batch_worker, monkeypatch, caplog
+        self, batch_worker, monkeypatch, caplog, error
     ):
-        calls = self.break_dispatch(batch_worker, monkeypatch, failures=None)
+        calls = self.break_dispatch(
+            batch_worker, monkeypatch, failures=None, error=error
+        )
         with caplog.at_level(logging.INFO, logger="django_ox"):
             thread = start_worker_thread(batch_worker)
             # The second attempt comes a schedule_interval after the first,
