@@ -140,8 +140,8 @@ python manage.py ox_worker --batch --concurrency 4
 "Nothing to claim" is a point-in-time observation by this worker, not a
 guarantee that the queue is empty or a workflow is complete. Future
 `run_after` tasks, backed-off retries, locked tasks and tasks excluded by
-claim filters may remain. With extensions, rate-limited READY tasks and
-WAITING workflow children may remain too. A pass that sees due tasks but
+claim filters may remain. With [Oxpull Pro](pro.md), rate-limited READY tasks
+and WAITING workflow children may remain too. A pass that sees due tasks but
 loses them all to other workers isn't empty, and the worker polls again.
 Immediately eligible follow-up work committed before a local task finishes
 can be picked up on a subsequent pass, unless another stop condition wins.
@@ -153,8 +153,9 @@ starts and keeps checking while it runs. Each schedule then enqueues only its
 most recent missed tick. A schedule that ticks more often than the job runs
 skips the ticks in between. A run that sees a schedule declared in settings
 for the first time records its current tick without enqueuing it; a stored
-schedule fires its first due tick. If every tick must run, keep a
-long-running worker too. See [Missed ticks](recurring-tasks.md#missed-ticks).
+schedule fires its first due tick. Use a long-running worker for more
+frequent schedule checks, but missed ticks are still coalesced; this does not
+guarantee that every tick runs. See [Missed ticks](recurring-tasks.md#missed-ticks).
 
 A database error doesn't end a batch, whether the server is unreachable or
 the django-ox tables are missing. Each failed pass is retried, as it is for a
