@@ -978,6 +978,12 @@ class Worker:
         self.batch = batch
         self.max_tasks = max_tasks
         self._claimed = 0
+        # Set by the compare-and-set claim when it read candidates and lost
+        # every one of them to another claimer. That None means the queue
+        # was busy, not empty, and --batch must not end on it. run() clears
+        # it before each claim_one(), so an override that returns None
+        # without calling the base claim never inherits a stale one.
+        self._claim_contended = False
         # Under a supervisor, the pid to watch: a worker whose supervisor has
         # gone (it was SIGKILLed, or died on a signal it could not forward)
         # is reparented, and drains rather than run on as an orphan.
@@ -1368,7 +1374,9 @@ class Worker:
         # requeued) the row between the fetch and this UPDATE, both have
         # moved and the literal bookkeeping values below cannot stomp its
         # writes.
+        read_any = False
         for candidate in self._ready_queryset()[:CLAIM_BATCH_SIZE]:
+            read_any = True
             granted_epoch = candidate.lease_epoch + 1
             claimed = (
                 OxTask.objects.using(self._db_alias)
@@ -1385,6 +1393,12 @@ class Worker:
                 if held is None:
                     continue
                 return held
+        # Every candidate went to another claimer, but the read only ever
+        # looks at CLAIM_BATCH_SIZE rows and more may be due behind them. The
+        # SKIP LOCKED paths never come back empty while an unlocked row is
+        # due, so only this one has to say so.
+        if read_any:
+            self._claim_contended = True
         return None
 
     def _reload_claimed(self, pk: uuid.UUID, granted_epoch: int) -> OxTask | None:
@@ -3535,9 +3549,13 @@ class Worker:
                         and not self._stop.is_set()
                         and not self._limit_reached()
                     ):
+                        self._claim_contended = False
                         db_task = self.claim_one()
                         if db_task is None:
-                            found_nothing = True
+                            # A claim that lost every race found a busy
+                            # queue rather than an empty one, so --batch
+                            # polls again instead of ending on it.
+                            found_nothing = not self._claim_contended
                             break
                         claimed_any = True
                         self._claimed += 1
