@@ -8,10 +8,11 @@ DOC = Path(__file__).resolve().parent.parent / "docs" / "monitoring.md"
 
 
 #: Events are emitted two ways: an inline `extra={"event": "..."}`, and as
-#: the first argument to Worker._log_extra. Both are matched, or the
-#: coverage claim below is not true.
+#: the first argument to a Worker helper that builds the extra itself,
+#: _log_extra or _complete. Both are matched, or the coverage claim below
+#: is not true.
 _INLINE = re.compile(r'"event":\s*"([a-z_]+)"')
-_HELPER = re.compile(r'_log_extra\(\s*"([a-z_]+)"')
+_HELPER = re.compile(r'\b(?:_log_extra|_complete)\(\s*"([a-z_]+)"')
 
 
 def emitted_events() -> set[str]:
