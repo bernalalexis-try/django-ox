@@ -1005,6 +1005,8 @@ python manage.py ox_worker [options]
 | `--interval` | `1.0` | Polling interval in seconds when idle. When tasks are in flight the worker wakes as soon as one finishes, so this does not bound throughput. |
 | `--lock-timeout` | backend `LOCK_TIMEOUT`, or 300 | Seconds a RUNNING task's lock may go unrefreshed before the task is reclaimed. |
 | `--database` | the alias `OxTask` writes to | Database alias to run against. Each `--processes` child is given the same one, so one router answering differently in two processes can't split a fleet across two databases. It is not checked against the router; see [Read replicas](#read-replicas). |
+| `--batch` | off | Exit once a poll pass succeeds, claims nothing, and leaves no task running, then drain and exit 0. Tasks whose `run_after` is still ahead, backed-off retries included, stay READY for a later worker. A pass interrupted by a database error, schedule dispatch included, does not count. Rejected with `--processes` above 1. See [Running as a job](production.md#running-as-a-job). |
+| `--max-tasks N` | none | Exit after claiming N task attempts, then drain and exit 0. Every claim counts, a failed attempt and a retry's repeat claim included, and concurrency never claims past N. Without `--batch` the worker keeps polling an empty queue until it reaches N or is stopped. N must be an integer of at least 1. Rejected with `--processes` above 1. |
 
 The command also honors Django's standard `-v/--verbosity`: at the default
 verbosity it logs worker lifecycle and warnings to stderr, and `-v 2`
@@ -2239,14 +2241,19 @@ Run `python manage.py migrate django_ox` to create the table.
 The decorator, `.enqueue()`, and result API stay the same. Worker options
 and queue selection differ.
 
-Of `db_worker`'s worker-specific options, only `--backend` and `--interval`
-carry over unchanged.
+Of `db_worker`'s worker-specific options, `--backend`, `--interval`,
+`--batch` and `--max-tasks` carry over by name.
 
 - Replace `--queue-name` with `--queues`.
-- Remove `--batch`, `--max-tasks`, `--reload`, `--no-reload`,
-  `--exclude-queues`, `--worker-id`, and `--no-startup-delay`.
-  `ox_worker` rejects these options as unrecognized arguments.
-- `ox_worker` does not support exit-when-idle or task-count limits.
+- `--batch` maps to `--batch`: the worker exits once nothing is left to
+  claim. Tasks scheduled for later, and failed attempts waiting out their
+  retry backoff, stay READY instead of keeping the worker alive.
+- `--max-tasks N` maps to `--max-tasks N`, counted in claims rather than
+  tasks: `ox_worker` retries failed attempts, and each attempt it claims,
+  a failed one or a retry's repeat, uses one of the N.
+- Remove `--reload`, `--no-reload`, `--exclude-queues`, `--worker-id`, and
+  `--no-startup-delay`. `ox_worker` rejects these options as unrecognized
+  arguments.
 - `ox_worker` does not autoreload. Without `--batch`, `db_worker` enables
   autoreload by default when `settings.DEBUG` is true.
 - `db_worker` runs only the `default` queue unless configured otherwise.
@@ -2916,6 +2923,34 @@ Run migrations before rolling any process that imports django-ox, web
 processes included: `enqueue()` writes every column the current schema has.
 Run them as an init container or a job, not from the worker itself; several
 workers starting at once would race the same migration.
+
+## Running as a job
+
+A cron entry or a job runner (a Kubernetes `Job`, a CI step, a scheduled
+container) needs a worker that ends on its own. `--batch` exits once a poll
+pass finds nothing it can claim and no task is left running; `--max-tasks N`
+exits after N claims. Either one stops claiming, drains the tasks in flight
+and exits 0, the same as a SIGTERM, and together the first to be reached
+ends the run.
+
+```
+python manage.py ox_worker --batch --concurrency 4
+```
+
+"Nothing to claim" is judged now, by this worker. A task scheduled for later
+with `run_after`, and a failed attempt waiting out its backoff, stay READY for
+the next run rather than keeping this one alive. Work a running task enqueues
+is picked up before the worker exits.
+
+A database the worker cannot reach does not end a batch. Each failed pass is
+retried, as it is for a long-running worker, and a failed pass never counts as
+an empty one, so a worker in a job keeps retrying for as long as the database
+is down. Give the job runner a timeout: it is what bounds a run against an
+unreachable database.
+
+Both flags run a single process. `--processes` above 1 is rejected, because
+the supervisor restarts a worker that exits on its own; for more throughput in
+one job, raise `--concurrency`, or run several jobs.
 
 ## Graceful shutdown
 
@@ -4092,6 +4127,8 @@ The message text is not part of the contract. The keys are.
 | `worker_drain_abandoned` | WARNING | A recycling worker stopped waiting on tasks that had not finished. Their leases expire and the reaper requeues them. Carries `pending`. |
 | `claim_filter_sql_missing` | WARNING | Once per worker: a subclass overrides `claim_filter_q()` without `claim_filter_sql()`, so the single-statement PostgreSQL claim is given up for the path that applies the hook. |
 | `worker_draining` | INFO | Shutdown began with tasks still in flight. |
+| `worker_batch_empty` | INFO | Under `--batch`, a poll pass succeeded, claimed nothing, and left no task running. The worker drains and stops. Carries `claimed`. |
+| `worker_max_tasks_reached` | INFO | Under `--max-tasks`, the worker claimed its limit. It drains and stops. Carries `claimed`. |
 | `worker_stopped` | INFO | The run loop exited. |
 | `supervisor_started` | INFO | `ox_worker --processes N` started its worker processes. |
 | `worker_process_restarted` | WARNING | A worker process exited on its own and is being restarted. |
@@ -4119,6 +4156,7 @@ A failed connect while recording a stuck attempt logs
 | --- | --- | --- |
 | `event` | all events | The event name from the table above. |
 | `worker_id` | all worker events | Unique id of the worker emitting the record. With `--processes`, the slot number is the last part of the id. |
+| `claimed` | `worker_batch_empty`, `worker_max_tasks_reached` | Task attempts this worker claimed in its run, failed attempts and retries included. |
 | `task_id` | task events | The task's UUID, as a string. |
 | `task_path` | task events | Dotted path of the task function. |
 | `queue` | task events | Queue name. |
@@ -4378,6 +4416,10 @@ export names this page does not list; those names are not public.
 - **The management commands** and their flags: `ox_worker`, `ox_prune`,
   `ox_health`. `ox_worker`'s exit codes: 0 after a drain, 130 on a forced
   exit, 75 when the worker recycles itself after a stuck task thread.
+  A worker that finishes under `--batch` or `--max-tasks` drains and exits
+  0, even when attempts failed; each outcome stays on its task row. An
+  invalid `--max-tasks`, or either flag with `--processes` above 1, exits 1
+  before any worker starts.
   Under `--processes`, the supervisor exits 0 when every worker drained
   or recycled, 1 when a slot hit the restart cap, and otherwise with the
   first other non-zero worker code. A worker killed by a signal reports
@@ -4936,6 +4978,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- `ox_worker --batch` exits once a poll pass finds nothing to claim and no
+  task is running, and `--max-tasks N` exits after N claimed attempts, for
+  cron and job runners. Both drain and exit 0, log `worker_batch_empty` or
+  `worker_max_tasks_reached` with the `claimed` count, and are rejected with
+  `--processes` above 1. `Worker` takes matching `batch` and `max_tasks`
+  keyword arguments, passed by the command only when the flag is given, so a
+  `WORKER_CLASS` with a fixed constructor keeps working (#73).
 
 ## [1.4.0] - 2026-09-23
 

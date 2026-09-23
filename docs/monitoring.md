@@ -300,6 +300,8 @@ The message text is not part of the contract. The keys are.
 | `worker_drain_abandoned` | WARNING | A recycling worker stopped waiting on tasks that had not finished. Their leases expire and the reaper requeues them. Carries `pending`. |
 | `claim_filter_sql_missing` | WARNING | Once per worker: a subclass overrides `claim_filter_q()` without `claim_filter_sql()`, so the single-statement PostgreSQL claim is given up for the path that applies the hook. |
 | `worker_draining` | INFO | Shutdown began with tasks still in flight. |
+| `worker_batch_empty` | INFO | Under `--batch`, a poll pass succeeded, claimed nothing, and left no task running. The worker drains and stops. Carries `claimed`. |
+| `worker_max_tasks_reached` | INFO | Under `--max-tasks`, the worker claimed its limit. It drains and stops. Carries `claimed`. |
 | `worker_stopped` | INFO | The run loop exited. |
 | `supervisor_started` | INFO | `ox_worker --processes N` started its worker processes. |
 | `worker_process_restarted` | WARNING | A worker process exited on its own and is being restarted. |
@@ -327,6 +329,7 @@ A failed connect while recording a stuck attempt logs
 | --- | --- | --- |
 | `event` | all events | The event name from the table above. |
 | `worker_id` | all worker events | Unique id of the worker emitting the record. With `--processes`, the slot number is the last part of the id. |
+| `claimed` | `worker_batch_empty`, `worker_max_tasks_reached` | Task attempts this worker claimed in its run, failed attempts and retries included. |
 | `task_id` | task events | The task's UUID, as a string. |
 | `task_path` | task events | Dotted path of the task function. |
 | `queue` | task events | Queue name. |

@@ -47,14 +47,19 @@ Run `python manage.py migrate django_ox` to create the table.
 The decorator, `.enqueue()`, and result API stay the same. Worker options
 and queue selection differ.
 
-Of `db_worker`'s worker-specific options, only `--backend` and `--interval`
-carry over unchanged.
+Of `db_worker`'s worker-specific options, `--backend`, `--interval`,
+`--batch` and `--max-tasks` carry over by name.
 
 - Replace `--queue-name` with `--queues`.
-- Remove `--batch`, `--max-tasks`, `--reload`, `--no-reload`,
-  `--exclude-queues`, `--worker-id`, and `--no-startup-delay`.
-  `ox_worker` rejects these options as unrecognized arguments.
-- `ox_worker` does not support exit-when-idle or task-count limits.
+- `--batch` maps to `--batch`: the worker exits once nothing is left to
+  claim. Tasks scheduled for later, and failed attempts waiting out their
+  retry backoff, stay READY instead of keeping the worker alive.
+- `--max-tasks N` maps to `--max-tasks N`, counted in claims rather than
+  tasks: `ox_worker` retries failed attempts, and each attempt it claims,
+  a failed one or a retry's repeat, uses one of the N.
+- Remove `--reload`, `--no-reload`, `--exclude-queues`, `--worker-id`, and
+  `--no-startup-delay`. `ox_worker` rejects these options as unrecognized
+  arguments.
 - `ox_worker` does not autoreload. Without `--batch`, `db_worker` enables
   autoreload by default when `settings.DEBUG` is true.
 - `db_worker` runs only the `default` queue unless configured otherwise.

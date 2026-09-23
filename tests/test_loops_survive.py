@@ -348,3 +348,76 @@ class TestThePrivateDjangoAttributesStillExist:
             f"Django no longer has BaseDatabaseWrapper.{attribute}, so "
             "_discard_connections silently stops resetting it"
         )
+
+
+class TestABatchPassMustSucceed:
+    """
+    `--batch` ends run() on a pass that found nothing, and a pass the
+    database interrupted found out nothing: it cannot count as empty.
+    """
+
+    @pytest.fixture
+    def batch_worker(self, settings):
+        settings.TASKS = {
+            "default": {
+                "BACKEND": "django_ox.backend.OxBackend",
+                "QUEUES": ["default"],
+                "OPTIONS": {},
+            }
+        }
+        return Worker(
+            backoff_initial=0,
+            poll_interval=0.02,
+            reap_interval=0.0,
+            schedule_interval=0.0,
+            batch=True,
+        )
+
+    def run_to_completion(self, worker, caplog):
+        thread = threading.Thread(target=worker.run, daemon=True)
+        with caplog.at_level(logging.INFO, logger="django_ox"):
+            thread.start()
+            thread.join(timeout=10)
+        assert not thread.is_alive(), "the batch worker never finished"
+
+    @pytest.mark.django_db(transaction=True)
+    def test_a_failed_claim_is_not_an_empty_pass(
+        self, batch_worker, monkeypatch, caplog
+    ):
+        calls = []
+        real_claim = batch_worker.claim_one
+
+        def claim_once_broken():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OperationalError("gone")
+            return real_claim()
+
+        monkeypatch.setattr(batch_worker, "claim_one", claim_once_broken)
+        self.run_to_completion(batch_worker, caplog)
+
+        assert events(caplog, "worker_poll_failed")
+        assert len(calls) >= 2, "the pass the database interrupted ended the batch"
+        (done,) = events(caplog, "worker_batch_empty")
+        assert done.worker_id == batch_worker.worker_id
+        assert done.claimed == 0
+
+    @pytest.mark.django_db(transaction=True)
+    def test_a_failed_schedule_dispatch_is_not_an_empty_pass(
+        self, batch_worker, monkeypatch, caplog
+    ):
+        calls = []
+        real_dispatch = batch_worker.dispatch_schedules
+
+        def dispatch_once_broken():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OperationalError("gone")
+            return real_dispatch()
+
+        monkeypatch.setattr(batch_worker, "dispatch_schedules", dispatch_once_broken)
+        self.run_to_completion(batch_worker, caplog)
+
+        assert events(caplog, "schedule_dispatch_failed")
+        assert len(calls) >= 2, "the pass whose dispatch failed ended the batch"
+        assert len(events(caplog, "worker_batch_empty")) == 1

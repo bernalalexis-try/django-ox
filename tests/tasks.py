@@ -281,3 +281,10 @@ def query_then_sleep(log_path, seconds):
     time.sleep(seconds)
     _mark(log_path, "END")
     return "done"
+
+
+@task
+def enqueue_follow_up(label):
+    """Enqueue another task from inside one, as a fan-out job does."""
+    echo.enqueue(label)
+    return label

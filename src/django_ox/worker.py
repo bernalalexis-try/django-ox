@@ -955,6 +955,8 @@ class Worker:
         task_timeout: float | None = None,
         task_timeout_grace: float | None = None,
         db_alias: str | None = None,
+        batch: bool = False,
+        max_tasks: int | None = None,
     ) -> None:
         backend = task_backends[backend_alias]
         if not isinstance(backend, OxBackend):
@@ -969,6 +971,13 @@ class Worker:
         self.queues: list[str] = list(queues) if queues else sorted(backend.queues)
         self.concurrency = concurrency
         self.poll_interval = poll_interval
+        # Both end run() through request_stop() and the normal drain, so a
+        # job runner gets the same shutdown as a signal. The count is of
+        # claims, not outcomes: a failed attempt and a retry's repeat claim
+        # each used a slot of work.
+        self.batch = batch
+        self.max_tasks = max_tasks
+        self._claimed = 0
         # Under a supervisor, the pid to watch: a worker whose supervisor has
         # gone (it was SIGKILLed, or died on a signal it could not forward)
         # is reparented, and drains rather than run on as an orphan.
@@ -3378,6 +3387,27 @@ class Worker:
     def stopping(self) -> bool:
         return self._stop.is_set()
 
+    def _limit_reached(self) -> bool:
+        return self.max_tasks is not None and self._claimed >= self.max_tasks
+
+    def _complete(self, event: str, message: str) -> None:
+        # A stop already under way came from outside, and it is that stop
+        # the log should record rather than a completion that did not decide
+        # anything.
+        if self._stop.is_set():
+            return
+        logger.info(
+            message,
+            self.worker_id,
+            self._claimed,
+            extra={
+                "event": event,
+                "worker_id": self.worker_id,
+                "claimed": self._claimed,
+            },
+        )
+        self.request_stop()
+
     def _close_connections_in_thread(self, barrier: Barrier) -> None:
         # The barrier makes every pool thread take exactly one of these
         # tasks; without it one idle thread could consume several and leave
@@ -3456,6 +3486,7 @@ class Worker:
                     )
                     self.request_stop()
                     break
+                dispatch_failed = False
                 try:
                     if time.monotonic() - last_reap >= self.reap_interval:
                         self.reap()
@@ -3489,14 +3520,27 @@ class Worker:
                                 },
                             )
                             close_old_connections()
+                            dispatch_failed = True
                         last_dispatch = time.monotonic()
                     in_flight = {f for f in in_flight if not f.done()}
+                    # Read before claiming, not after: a task still running
+                    # when the claim finds nothing can enqueue work and
+                    # finish before a later look, which would then see an
+                    # idle worker and an empty queue that is not empty.
+                    idle = not in_flight
                     claimed_any = False
-                    while len(in_flight) < self.concurrency and not self._stop.is_set():
+                    found_nothing = False
+                    while (
+                        len(in_flight) < self.concurrency
+                        and not self._stop.is_set()
+                        and not self._limit_reached()
+                    ):
                         db_task = self.claim_one()
                         if db_task is None:
+                            found_nothing = True
                             break
                         claimed_any = True
+                        self._claimed += 1
                         in_flight.add(executor.submit(self._execute_in_thread, db_task))
                 except Error:
                     # django.db.Error rather than DatabaseError: InterfaceError
@@ -3533,6 +3577,24 @@ class Worker:
                     # would also tear down a connection the caller owns.
                     close_old_connections()
                     self._stop.wait(self.poll_interval)
+                    continue
+                if self._limit_reached():
+                    self._complete(
+                        "worker_max_tasks_reached",
+                        "Worker %s reached its task limit after %d claim(s); stopping",
+                    )
+                    continue
+                if (
+                    self.batch
+                    and idle
+                    and found_nothing
+                    and not claimed_any
+                    and not dispatch_failed
+                ):
+                    self._complete(
+                        "worker_batch_empty",
+                        "Worker %s found nothing to claim after %d claim(s); stopping",
+                    )
                     continue
                 if not claimed_any:
                     if in_flight:

@@ -121,6 +121,34 @@ processes included: `enqueue()` writes every column the current schema has.
 Run them as an init container or a job, not from the worker itself; several
 workers starting at once would race the same migration.
 
+## Running as a job
+
+A cron entry or a job runner (a Kubernetes `Job`, a CI step, a scheduled
+container) needs a worker that ends on its own. `--batch` exits once a poll
+pass finds nothing it can claim and no task is left running; `--max-tasks N`
+exits after N claims. Either one stops claiming, drains the tasks in flight
+and exits 0, the same as a SIGTERM, and together the first to be reached
+ends the run.
+
+```
+python manage.py ox_worker --batch --concurrency 4
+```
+
+"Nothing to claim" is judged now, by this worker. A task scheduled for later
+with `run_after`, and a failed attempt waiting out its backoff, stay READY for
+the next run rather than keeping this one alive. Work a running task enqueues
+is picked up before the worker exits.
+
+A database the worker cannot reach does not end a batch. Each failed pass is
+retried, as it is for a long-running worker, and a failed pass never counts as
+an empty one, so a worker in a job keeps retrying for as long as the database
+is down. Give the job runner a timeout: it is what bounds a run against an
+unreachable database.
+
+Both flags run a single process. `--processes` above 1 is rejected, because
+the supervisor restarts a worker that exits on its own; for more throughput in
+one job, raise `--concurrency`, or run several jobs.
+
 ## Graceful shutdown
 
 On SIGTERM or SIGINT the worker:

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `ox_worker --batch` exits once a poll pass finds nothing to claim and no
+  task is running, and `--max-tasks N` exits after N claimed attempts, for
+  cron and job runners. Both drain and exit 0, log `worker_batch_empty` or
+  `worker_max_tasks_reached` with the `claimed` count, and are rejected with
+  `--processes` above 1. `Worker` takes matching `batch` and `max_tasks`
+  keyword arguments, passed by the command only when the flag is given, so a
+  `WORKER_CLASS` with a fixed constructor keeps working (#73).
+
 ## [1.4.0] - 2026-09-23
 
 If you use Django's PostgreSQL pool, check PostgreSQL `max_connections`
