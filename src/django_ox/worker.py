@@ -3469,6 +3469,12 @@ class Worker:
         in_flight: set[Future[None]] = set()
         last_reap = 0.0
         last_dispatch = 0.0
+        # Set by a failed schedule dispatch and cleared only by one that
+        # succeeds, not per pass. Dispatch runs once per schedule_interval,
+        # at least a second by default, so under a shorter poll the passes
+        # after a failure do not dispatch at all, and --batch must not end
+        # on one of them while a due tick may never have been enqueued.
+        dispatch_owed = False
         executor = ThreadPoolExecutor(
             max_workers=self.concurrency, thread_name_prefix="ox"
         )
@@ -3500,7 +3506,6 @@ class Worker:
                     )
                     self.request_stop()
                     break
-                dispatch_failed = False
                 try:
                     if time.monotonic() - last_reap >= self.reap_interval:
                         self.reap()
@@ -3534,7 +3539,9 @@ class Worker:
                                 },
                             )
                             close_old_connections()
-                            dispatch_failed = True
+                            dispatch_owed = True
+                        else:
+                            dispatch_owed = False
                         last_dispatch = time.monotonic()
                     in_flight = {f for f in in_flight if not f.done()}
                     # Read before claiming, not after: a task still running
@@ -3607,7 +3614,7 @@ class Worker:
                     and idle
                     and found_nothing
                     and not claimed_any
-                    and not dispatch_failed
+                    and not dispatch_owed
                 ):
                     self._complete(
                         "worker_batch_empty",
