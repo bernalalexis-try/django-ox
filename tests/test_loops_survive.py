@@ -406,9 +406,10 @@ class TestABatchPassMustSucceed:
         return calls
 
     def run_to_completion(self, worker, caplog):
-        thread = threading.Thread(target=worker.run, daemon=True)
+        # Registered, so a batch that never finishes is stopped and joined
+        # when the test ends instead of claiming the next test's tasks.
         with caplog.at_level(logging.INFO, logger="django_ox"):
-            thread.start()
+            thread = start_worker_thread(worker)
             thread.join(timeout=10)
         assert not thread.is_alive(), "the batch worker never finished"
 

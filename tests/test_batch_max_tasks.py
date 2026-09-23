@@ -10,6 +10,7 @@ import json
 import signal
 import subprocess
 import time
+from collections import Counter
 from datetime import timedelta
 
 import pytest
@@ -33,15 +34,31 @@ def finish(proc, log, timeout=30):
     finally:
         if proc.poll() is None:
             proc.kill()
-            proc.wait()
+            proc.wait(timeout=10)
 
 
 def statuses(results):
     return [OxTask.objects.get(id=r.id).status for r in results]
 
 
-def claimed_rows():
-    return OxTask.objects.exclude(status=OxTask.Status.READY).count()
+def counts():
+    return Counter(OxTask.objects.values_list("status", flat=True))
+
+
+def assert_drained_after(log, completion):
+    """The completion line, then worker_stopped, which comes after the drain."""
+    text = log.read_text()
+    assert completion in text, text
+    assert "stopped" in text[text.index(completion) :], text
+
+
+def logged_at(log, text):
+    """When the worker logged the first line containing text, as time.time()."""
+    for line in log.read_text().splitlines():
+        stamp, _, message = line.partition(" ")
+        if text in message:
+            return float(stamp)
+    pytest.fail(f"the worker never logged {text!r}:\n{log.read_text()}")
 
 
 class TestBatch:
@@ -55,16 +72,16 @@ class TestBatch:
         assert "stopped" in log.read_text()
 
     def test_an_empty_queue_exits_without_waiting_for_the_interval(self, tmp_path):
+        env = child_env()
+        env["OX_TEST_LOG_FORMAT"] = "%(created)f %(message)s"
         log = tmp_path / "worker.log"
-        proc = start_worker(tmp_path, "--batch", "--interval", "5")
-        try:
-            assert wait_for(lambda: "starting" in log.read_text(), timeout=30)
-            started = time.monotonic()
-            assert finish(proc, log) == 0, log.read_text()
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-        assert time.monotonic() - started < 2, log.read_text()
+        proc = start_worker(tmp_path, "--batch", "--interval", "5", env=env)
+        assert finish(proc, log) == 0, log.read_text()
+        exited = time.time()
+        # Timed from the worker's own worker_started record. A clock started
+        # when the test noticed the line starts late by however long the
+        # noticing took, and hides that much of a slow exit.
+        assert exited - logged_at(log, "starting") < 2, log.read_text()
         assert "found nothing to claim after 0 claim(s)" in log.read_text()
 
     def test_leaves_future_work_and_backed_off_retries_ready(self, tmp_path):
@@ -138,8 +155,13 @@ class TestMaxTasks:
             tmp_path, "--max-tasks", "2", "--concurrency", "4", "--interval", "0.05"
         )
         assert finish(proc, log) == 0, log.read_text()
-        assert claimed_rows() == 2
-        assert "reached its task limit after 2 claim(s)" in log.read_text()
+        # The limit stops claiming, not running: both claimed attempts ran
+        # to the end before the worker exited.
+        assert counts() == {
+            OxTask.Status.SUCCESSFUL: 2,
+            OxTask.Status.READY: 3,
+        }, log.read_text()
+        assert_drained_after(log, "reached its task limit after 2 claim(s)")
 
     def test_a_failed_attempt_counts(self, tmp_path):
         failing = fail_always.enqueue()
@@ -147,7 +169,11 @@ class TestMaxTasks:
         log = tmp_path / "worker.log"
         proc = start_worker(tmp_path, "--max-tasks", "1", "--interval", "0.05")
         assert finish(proc, log) == 0, log.read_text()
-        assert OxTask.objects.get(id=failing.id).attempts == 1
+        row = OxTask.objects.get(id=failing.id)
+        assert row.attempts == 1
+        # The attempt ran and was recorded as a retry, not left RUNNING.
+        assert row.status == OxTask.Status.READY, log.read_text()
+        assert len(row.errors) == 1
         assert OxTask.objects.get(id=never.id).attempts == 0
         assert "reached its task limit after 1 claim(s)" in log.read_text()
 
@@ -163,7 +189,8 @@ class TestMaxTasks:
         finally:
             code = finish(proc, log)
         assert code == 0, log.read_text()
-        assert claimed_rows() == 2
+        assert counts() == {OxTask.Status.SUCCESSFUL: 2}, log.read_text()
+        assert_drained_after(log, "reached its task limit after 2 claim(s)")
 
 
 class TestCombined:
@@ -175,8 +202,11 @@ class TestCombined:
             tmp_path, "--batch", "--max-tasks", "2", "--interval", "0.05"
         )
         assert finish(proc, log) == 0, log.read_text()
-        assert claimed_rows() == 2
-        assert "reached its task limit" in log.read_text()
+        assert counts() == {
+            OxTask.Status.SUCCESSFUL: 2,
+            OxTask.Status.READY: 1,
+        }, log.read_text()
+        assert_drained_after(log, "reached its task limit after 2 claim(s)")
         assert "found nothing to claim" not in log.read_text()
 
     def test_the_empty_queue_first(self, tmp_path):
