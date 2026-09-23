@@ -1005,7 +1005,7 @@ python manage.py ox_worker [options]
 | `--interval` | `1.0` | Polling interval in seconds when idle. When tasks are in flight the worker wakes as soon as one finishes, so this does not bound throughput. |
 | `--lock-timeout` | backend `LOCK_TIMEOUT`, or 300 | Seconds a RUNNING task's lock may go unrefreshed before the task is reclaimed. |
 | `--database` | the alias `OxTask` writes to | Database alias to run against. Each `--processes` child is given the same one, so one router answering differently in two processes can't split a fleet across two databases. It is not checked against the router; see [Read replicas](#read-replicas). |
-| `--batch` | off | Exit once a poll pass succeeds, claims nothing, and leaves no task running, then drain and exit 0. Tasks whose `run_after` is still ahead, backed-off retries included, stay READY for a later worker. A pass interrupted by a database error, schedule dispatch included, does not count. Rejected with `--processes` above 1. See [Running as a job](production.md#running-as-a-job). |
+| `--batch` | off | Exit once a poll pass succeeds, sees no task it can claim, and began with no task of its own in flight, then drain and exit 0. Tasks it can't claim at that moment stay READY for a later worker. These include future `run_after` tasks, backed-off retries, locked rows and tasks its claim filter excludes. A pass that hits a database error does not count, and after a failed schedule dispatch no pass counts until a dispatch succeeds. Rejected with `--processes` above 1. See [Running as a job](production.md#running-as-a-job). |
 | `--max-tasks N` | none | Exit after claiming N task attempts, then drain and exit 0. Every claim counts, a failed attempt and a retry's repeat claim included, and concurrency never claims past N. Without `--batch` the worker keeps polling an empty queue until it reaches N or is stopped. N must be an integer of at least 1. Rejected with `--processes` above 1. |
 
 The command also honors Django's standard `-v/--verbosity`: at the default
@@ -2245,12 +2245,17 @@ Of `db_worker`'s worker-specific options, `--backend`, `--interval`,
 `--batch` and `--max-tasks` carry over by name.
 
 - Replace `--queue-name` with `--queues`.
-- `--batch` maps to `--batch`: the worker exits once nothing is left to
-  claim. Tasks scheduled for later, and failed attempts waiting out their
-  retry backoff, stay READY instead of keeping the worker alive.
-- `--max-tasks N` maps to `--max-tasks N`, counted in claims rather than
-  tasks: `ox_worker` retries failed attempts, and each attempt it claims,
-  a failed one or a retry's repeat, uses one of the N.
+- `--batch` maps by name to `--batch`. In `ox_worker`, it ends after an
+  error-free empty claim pass with no local tasks in flight; it does not
+  wait for future tasks, retry backoff or deferred releases. `db_worker`
+  exits with a traceback when the database is unreachable or its tables are
+  missing. `ox_worker` keeps retrying, a failed schedule dispatch included,
+  and doesn't end the batch until a retry succeeds. Give the job a timeout,
+  as [Running as a job](production.md#running-as-a-job) explains.
+- `--max-tasks N` maps by name to `--max-tasks N`. In `ox_worker`, every
+  claimed attempt consumes one of N, including failed attempts and repeat
+  claims of the same task. These mappings do not imply identical completion
+  or retry semantics between the workers.
 - Remove `--reload`, `--no-reload`, `--exclude-queues`, `--worker-id`, and
   `--no-startup-delay`. `ox_worker` rejects these options as unrecognized
   arguments.
@@ -2926,27 +2931,43 @@ workers starting at once would race the same migration.
 
 ## Running as a job
 
-A cron entry or a job runner (a Kubernetes `Job`, a CI step, a scheduled
-container) needs a worker that ends on its own. `--batch` exits once a poll
-pass finds nothing it can claim and no task is left running; `--max-tasks N`
-exits after N claims. Either one stops claiming, drains the tasks in flight
-and exits 0, the same as a SIGTERM, and together the first to be reached
-ends the run.
+For cron and job runners, `--batch` stops after an error-free polling pass
+observes no claimable task, claims nothing, and began claiming with no local
+tasks in flight. If a schedule dispatch failed, a later one must succeed
+first. `--max-tasks N` stops after N claimed attempts, including failed
+attempts and repeat claims of retries; without `--batch`, an empty queue does
+not end the run. Combined, the first completion condition reached stops
+further claims and drains in-flight tasks. Normal completion exits 0 even if
+attempts failed; recycling and forced shutdown retain their existing exit
+codes.
 
 ```
 python manage.py ox_worker --batch --concurrency 4
 ```
 
-"Nothing to claim" is judged now, by this worker. A task scheduled for later
-with `run_after`, and a failed attempt waiting out its backoff, stay READY for
-the next run rather than keeping this one alive. Work a running task enqueues
-is picked up before the worker exits.
+"Nothing to claim" is a point-in-time observation by this worker, not a
+guarantee that the queue is empty or a workflow is complete. Future
+`run_after` tasks, backed-off retries, locked tasks and tasks excluded by
+claim filters may remain. With extensions, rate-limited READY tasks and
+WAITING workflow children may remain too. A pass that sees due tasks but
+loses them all to other workers isn't empty, and the worker polls again.
+Immediately eligible follow-up work committed before a local task finishes
+can be picked up on a subsequent pass, unless another stop condition wins.
+Batch mode does not wait for later commits, schedule ticks or reconciler
+hand-offs; arrange another run or use a long-running worker for that work.
 
-A database the worker cannot reach does not end a batch. Each failed pass is
-retried, as it is for a long-running worker, and a failed pass never counts as
-an empty one, so a worker in a job keeps retrying for as long as the database
-is down. Give the job runner a timeout: it is what bounds a run against an
-unreachable database.
+Schedules dispatch only while a worker runs. A batch checks them when it
+starts and keeps checking while it runs. Each schedule then enqueues only its
+most recent missed tick. A schedule that ticks more often than the job runs
+skips the ticks in between. A run that sees a new schedule for the first time
+records its current tick without enqueuing it. If every tick must run, keep a
+long-running worker too. See [Missed ticks](recurring-tasks.md#missed-ticks).
+
+A database error doesn't end a batch, whether the server is unreachable or
+the django-ox tables are missing. Each failed pass is retried, as it is for a
+long-running worker, and a failed pass never counts as an empty one. So a
+worker in a job keeps retrying for as long as the error lasts. Give the job
+runner a timeout: it is what bounds a run against a failing database.
 
 Both flags run a single process. `--processes` above 1 is rejected, because
 the supervisor restarts a worker that exits on its own; for more throughput in
@@ -5011,8 +5032,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cron and job runners. Both drain and exit 0, log `worker_batch_empty` or
   `worker_max_tasks_reached` with the `claimed` count, and are rejected with
   `--processes` above 1. `Worker` takes matching `batch` and `max_tasks`
-  keyword arguments, passed by the command only when the flag is given, so a
-  `WORKER_CLASS` with a fixed constructor keeps working (#73).
+  keyword arguments, passed by the command only when the flag is given, so
+  existing fixed-signature `WORKER_CLASS` constructors keep working when
+  neither new flag is supplied.
 
 ## [1.4.0] - 2026-09-23
 

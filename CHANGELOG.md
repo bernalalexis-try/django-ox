@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cron and job runners. Both drain and exit 0, log `worker_batch_empty` or
   `worker_max_tasks_reached` with the `claimed` count, and are rejected with
   `--processes` above 1. `Worker` takes matching `batch` and `max_tasks`
-  keyword arguments, passed by the command only when the flag is given, so a
-  `WORKER_CLASS` with a fixed constructor keeps working (#73).
+  keyword arguments, passed by the command only when the flag is given, so
+  existing fixed-signature `WORKER_CLASS` constructors keep working when
+  neither new flag is supplied.
 
 ## [1.4.0] - 2026-09-23
 

@@ -123,27 +123,43 @@ workers starting at once would race the same migration.
 
 ## Running as a job
 
-A cron entry or a job runner (a Kubernetes `Job`, a CI step, a scheduled
-container) needs a worker that ends on its own. `--batch` exits once a poll
-pass finds nothing it can claim and no task is left running; `--max-tasks N`
-exits after N claims. Either one stops claiming, drains the tasks in flight
-and exits 0, the same as a SIGTERM, and together the first to be reached
-ends the run.
+For cron and job runners, `--batch` stops after an error-free polling pass
+observes no claimable task, claims nothing, and began claiming with no local
+tasks in flight. If a schedule dispatch failed, a later one must succeed
+first. `--max-tasks N` stops after N claimed attempts, including failed
+attempts and repeat claims of retries; without `--batch`, an empty queue does
+not end the run. Combined, the first completion condition reached stops
+further claims and drains in-flight tasks. Normal completion exits 0 even if
+attempts failed; recycling and forced shutdown retain their existing exit
+codes.
 
 ```
 python manage.py ox_worker --batch --concurrency 4
 ```
 
-"Nothing to claim" is judged now, by this worker. A task scheduled for later
-with `run_after`, and a failed attempt waiting out its backoff, stay READY for
-the next run rather than keeping this one alive. Work a running task enqueues
-is picked up before the worker exits.
+"Nothing to claim" is a point-in-time observation by this worker, not a
+guarantee that the queue is empty or a workflow is complete. Future
+`run_after` tasks, backed-off retries, locked tasks and tasks excluded by
+claim filters may remain. With extensions, rate-limited READY tasks and
+WAITING workflow children may remain too. A pass that sees due tasks but
+loses them all to other workers isn't empty, and the worker polls again.
+Immediately eligible follow-up work committed before a local task finishes
+can be picked up on a subsequent pass, unless another stop condition wins.
+Batch mode does not wait for later commits, schedule ticks or reconciler
+hand-offs; arrange another run or use a long-running worker for that work.
 
-A database the worker cannot reach does not end a batch. Each failed pass is
-retried, as it is for a long-running worker, and a failed pass never counts as
-an empty one, so a worker in a job keeps retrying for as long as the database
-is down. Give the job runner a timeout: it is what bounds a run against an
-unreachable database.
+Schedules dispatch only while a worker runs. A batch checks them when it
+starts and keeps checking while it runs. Each schedule then enqueues only its
+most recent missed tick. A schedule that ticks more often than the job runs
+skips the ticks in between. A run that sees a new schedule for the first time
+records its current tick without enqueuing it. If every tick must run, keep a
+long-running worker too. See [Missed ticks](recurring-tasks.md#missed-ticks).
+
+A database error doesn't end a batch, whether the server is unreachable or
+the django-ox tables are missing. Each failed pass is retried, as it is for a
+long-running worker, and a failed pass never counts as an empty one. So a
+worker in a job keeps retrying for as long as the error lasts. Give the job
+runner a timeout: it is what bounds a run against a failing database.
 
 Both flags run a single process. `--processes` above 1 is rejected, because
 the supervisor restarts a worker that exits on its own; for more throughput in
