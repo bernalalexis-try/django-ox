@@ -2959,15 +2959,18 @@ hand-offs; arrange another run or use a long-running worker for that work.
 Schedules dispatch only while a worker runs. A batch checks them when it
 starts and keeps checking while it runs. Each schedule then enqueues only its
 most recent missed tick. A schedule that ticks more often than the job runs
-skips the ticks in between. A run that sees a new schedule for the first time
-records its current tick without enqueuing it. If every tick must run, keep a
+skips the ticks in between. A run that sees a schedule declared in settings
+for the first time records its current tick without enqueuing it; a stored
+schedule fires its first due tick. If every tick must run, keep a
 long-running worker too. See [Missed ticks](recurring-tasks.md#missed-ticks).
 
 A database error doesn't end a batch, whether the server is unreachable or
 the django-ox tables are missing. Each failed pass is retried, as it is for a
 long-running worker, and a failed pass never counts as an empty one. So a
-worker in a job keeps retrying for as long as the error lasts. Give the job
-runner a timeout: it is what bounds a run against a failing database.
+worker in a job keeps retrying for as long as the error lasts. That includes
+a schedule the database rejects on every dispatch, which holds every batch
+run, so alert on `schedule_dispatch_failed`. Give the job runner a timeout:
+it is what bounds a run against a failing database.
 
 Both flags run a single process. `--processes` above 1 is rejected, because
 the supervisor restarts a worker that exits on its own; for more throughput in
@@ -5027,8 +5030,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordinary change-list visits. The page shows status counts, eligible backlog
   and age, five-minute throughput and failure rate, and time since the last
   claim.
-- `ox_worker --batch` exits once a poll pass finds nothing to claim and no
-  task is running, and `--max-tasks N` exits after N claimed attempts, for
+- `ox_worker --batch` exits once a poll pass finds nothing to claim and none
+  of its own tasks is running, and `--max-tasks N` exits after N claimed attempts, for
   cron and job runners. Both drain and exit 0, log `worker_batch_empty` or
   `worker_max_tasks_reached` with the `claimed` count, and are rejected with
   `--processes` above 1. `Worker` takes matching `batch` and `max_tasks`

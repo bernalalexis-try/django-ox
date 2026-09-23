@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ordinary change-list visits. The page shows status counts, eligible backlog
   and age, five-minute throughput and failure rate, and time since the last
   claim.
-- `ox_worker --batch` exits once a poll pass finds nothing to claim and no
-  task is running, and `--max-tasks N` exits after N claimed attempts, for
+- `ox_worker --batch` exits once a poll pass finds nothing to claim and none
+  of its own tasks is running, and `--max-tasks N` exits after N claimed attempts, for
   cron and job runners. Both drain and exit 0, log `worker_batch_empty` or
   `worker_max_tasks_reached` with the `claimed` count, and are rejected with
   `--processes` above 1. `Worker` takes matching `batch` and `max_tasks`

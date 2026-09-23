@@ -170,7 +170,7 @@ python manage.py ox_worker
 | `--interval` | `1.0` | Polling interval in seconds when idle. |
 | `--lock-timeout` | backend `LOCK_TIMEOUT` | Seconds a RUNNING task's lock may go unrefreshed before the task is reclaimed. |
 | `--database` | the alias `OxTask` writes to | Database alias to run against. Every `--processes` child is given the same one. It is not checked against the router. |
-| `--batch` | off | Exit once a poll pass finds nothing to claim and no task is running. For cron and job runners. Single process only. |
+| `--batch` | off | Exit once a poll pass finds nothing to claim and none of its own tasks is running. For cron and job runners. Single process only. |
 | `--max-tasks N` | none | Exit after claiming N task attempts, failed attempts and retries included. Single process only. |
 
 On SIGTERM or SIGINT the worker stops claiming, finishes in-flight tasks, then
