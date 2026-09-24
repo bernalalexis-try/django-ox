@@ -77,6 +77,17 @@ class TestParseDuration:
         with pytest.raises(CommandError):
             parse_duration(value)
 
+    @pytest.mark.parametrize(
+        "value", ["1000000000d", "99999999999999d", "9" * 5000 + "d"]
+    )
+    def test_rejects_out_of_range(self, value):
+        with pytest.raises(CommandError, match="out of range"):
+            parse_duration(value)
+
+    def test_a_duration_that_only_overflows_at_the_cutoff_still_parses(self):
+        # ox_prune's own guard catches this one; see TestOutOfRangeDuration.
+        assert parse_duration("3000000d") == timedelta(days=3_000_000)
+
 
 @pytest.mark.django_db
 class TestPrune:
@@ -1313,3 +1324,46 @@ class TestPruneJsonFormat:
         assert "Stopped after deleting 2 " in captured.err
         assert pauses == [1, 2]
         assert OxTask.objects.count() == 3
+
+
+OUT_OF_RANGE = ["3000000d", "1000000000d", "99999999999999d", "9" * 5000 + "d"]
+
+
+@pytest.mark.django_db(transaction=True)
+class TestOutOfRangeDuration:
+    """#82: a retention too large to subtract is an argument error."""
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    @pytest.mark.parametrize("value", OUT_OF_RANGE)
+    def test_is_a_command_error_and_deletes_nothing(self, value, dry_run):
+        make_old_rows(3, OxTask.Status.SUCCESSFUL)
+        args = [f"--older-than={value}", *(["--dry-run"] if dry_run else [])]
+
+        with pytest.raises(CommandError, match="out of range"):
+            prune(*args)
+
+        assert OxTask.objects.count() == 3
+
+    def test_exits_1_without_a_traceback_from_the_command_line(self, capsys):
+        make_old_rows(3, OxTask.Status.SUCCESSFUL)
+        argv = ["manage.py", "ox_prune", "--older-than=3000000d", "--skip-checks"]
+
+        with pytest.raises(SystemExit) as info:
+            ManagementUtility(argv).execute()
+
+        assert info.value.code == 1
+        err = capsys.readouterr().err
+        assert "Invalid duration '3000000d'; it is out of range." in err
+        assert "Traceback" not in err
+        assert OxTask.objects.count() == 3
+
+    def test_traceback_flag_still_raises(self):
+        argv = [
+            "manage.py",
+            "ox_prune",
+            "--older-than=3000000d",
+            "--skip-checks",
+            "--traceback",
+        ]
+        with pytest.raises(CommandError, match="out of range"):
+            ManagementUtility(argv).execute()

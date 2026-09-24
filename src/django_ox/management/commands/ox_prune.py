@@ -75,7 +75,14 @@ class Command(DatabaseCommand):
         # Once, before the first statement. Every queryset below is built on
         # this alias, so the rows the command reads are the rows it deletes.
         alias = self.database(options)
-        cutoff = timezone.now() - parse_duration(options["older_than"])
+        older_than = options["older_than"]
+        try:
+            cutoff = timezone.now() - parse_duration(older_than)
+        except OverflowError:
+            # A duration timedelta can hold may still reach back past year 1.
+            raise CommandError(
+                f"Invalid duration {older_than!r}; it is out of range."
+            ) from None
         # DISCARDED prunes with SUCCESSFUL: the row is already closed, so
         # there is nothing left on it to wait for. WAITING is in neither
         # list, because that task has not run.

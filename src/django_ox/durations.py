@@ -27,10 +27,15 @@ def _whole_seconds(text: str) -> int | None:
 
 def parse_duration(value: str) -> timedelta:
     """Parse '7d' / '24h' / '90m' / '45s' or a plain number of seconds."""
-    seconds = _whole_seconds(value.strip())
-    if seconds is None:
-        raise CommandError(f"Invalid duration {value!r}; {_FORMS}.")
-    return timedelta(seconds=seconds)
+    try:
+        seconds = _whole_seconds(value.strip())
+        if seconds is not None:
+            return timedelta(seconds=seconds)
+    except (ValueError, OverflowError):
+        # int() refuses digit strings past its conversion limit, and
+        # timedelta() anything past 999999999 days.
+        raise CommandError(f"Invalid duration {value!r}; it is out of range.") from None
+    raise CommandError(f"Invalid duration {value!r}; {_FORMS}.")
 
 
 def parse_seconds(value: str) -> float:
