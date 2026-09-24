@@ -67,6 +67,7 @@ class TestParseDuration:
             ("90m", timedelta(minutes=90)),
             ("45s", timedelta(seconds=45)),
             ("3600", timedelta(seconds=3600)),
+            ("0", timedelta(0)),
             (" 7d ", timedelta(days=7)),
         ],
     )
@@ -100,6 +101,14 @@ class TestPrune:
             prune("--older-than=soon")
 
         assert OxTask.objects.count() == 1
+
+    def test_zero_prunes_a_row_finished_just_now(self):
+        # The default 7d would keep this row.
+        just_finished = make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=0)
+
+        prune("--older-than=0")
+
+        assert not OxTask.objects.filter(pk=just_finished.pk).exists()
 
     def test_prunes_old_successful_only_by_default(self):
         old_ok = make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=8)
