@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `ox_prune --older-than` reports a duration too large to convert, or to
-  subtract from the current time, as a `CommandError` naming the value,
-  instead of a traceback. Nothing is deleted (#82).
+- `ox_prune --older-than` now rejects durations too large to convert or
+  subtract from the current time with a `CommandError` naming the value,
+  before deleting any rows (#82).
 - Documented the `worker_class` structured log key on
   `claim_filter_sql_missing` and added a source-to-documentation test for
   structured-log extra keys.
