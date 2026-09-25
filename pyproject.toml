@@ -63,6 +63,7 @@ dev = [
     "mypy>=1.16",
     "django-stubs>=6.0",
     "psycopg[binary,pool]>=3.2",
+    "prometheus-client",
 ]
 
 [tool.hatch.build.targets.sdist]
