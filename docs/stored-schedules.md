@@ -111,8 +111,9 @@ You can narrow it further. A registry entry may require a permission of its own:
 def run_payroll(): ...
 ```
 
-Anyone without `payroll.run_payroll` can see that schedule and cannot change it,
-whatever their permissions on the schedule table.
+Staff can see that schedule, but changing it requires `payroll.run_payroll`, whatever their schedule-table permissions. With `user=`, `update_schedule` checks both the stored entry under its row lock and the validated destination entry before writing. Changing the caller's in-memory `task_key` grants no permission. If the stored key cannot be read or is not registered in this process, only an active superuser may pause, change or delete it. A change must still end on a registered key; Enable and Run once still require a valid schedule.
+
+If workers import a task module that the web process doesn't, non-superuser staff cannot pause, change or delete its schedules. Import the same task module when the web process starts so its registry contains those keys. For an emergency pause, use an active superuser or call `update_schedule(OxSchedule(pk=pk), enabled=False)` without `user=` from trusted application code.
 
 Arguments get validated if you say how:
 
@@ -321,13 +322,15 @@ Skipping the row does not repair its invalid values. Database acceptance is
 determined at dispatch; a schedule-scoped dispatch failure is reported as
 `schedule_dispatch_error`.
 
-To pause a readable row that no longer validates, call `update_schedule` with
-`enabled=False` alone. This writes the disabled state without validating the
-rest of the row. It does not repair the row. Enabling it again is refused
-until the row is corrected.
+To pause by primary key, including when Django cannot load the row, call `update_schedule(OxSchedule(pk=pk), enabled=False)`. The call writes the disabled state without validating the whole row. Pausing does not repair stored values; enabling is refused until the row is corrected.
 
-`create_schedule`, `create_schedules` and `update_schedule` take an optional
-`user=`, and enforce any per-entry permission when you pass one.
+If the row remains unreadable, the returned instance contains readable fields and defers the others. Accessing those deferred fields can still fail through Django's ordinary reader. An unreadable name displays as `pk N`; this fallback is never stored or used for authorization. If read-back fails, the exception propagates but the schedule remains paused.
+
+`create_schedule`, `create_schedules`, `update_schedule` and `delete_schedule` accept optional `user=` and enforce per-entry permissions when supplied. Calls without `user` are trusted application code; they perform no user authorization. The admin supplies `request.user` and applies the same rules.
+
+`delete_schedule(schedule, *, user=None)` checks the stored key under the row's lock when a user is supplied. An already-deleted row is harmless. Without `user`, deletion neither reads the row nor checks permission. Write functions use the caller's primary key, including textual keys such as `OxSchedule(pk="7")`.
+
+When object-level authorization is needed, the backend receives the whole row from the write alias under the same lock. Accessing an unreadable field raises `StoredValueUnreadable` and refuses permission, rather than loading replica data. Model-wide permission checks and the active-superuser rule for unknown task keys come first.
 
 Use `create_schedules(rows, *, user=None)` for several schedules that should
 exist together, such as schedules added by a migration or the importer's
@@ -404,13 +407,11 @@ Stored-schedule writes reject start and end times outside years 1 to
 9999 in the database's time zone, and reject times with a time zone when
 `USE_TZ` is off.
 
-Stored-schedule reads isolate rows whose values cannot be converted,
-whose start or end cannot be compared with the worker's clock, or which
-cannot be built. Other schedules and the queue keep running. Database read
-errors stop the pass rather than being attributed to a row. Skips
-carry the row's key, name when readable, and reason. They are logged once,
-then at most once a minute per row per worker while the row stays skipped.
-Locked dispatch skips include a traceback only on the first line.
+Stored-schedule reads isolate rows holding a stored value django-ox cannot use, incomparable boundaries, or values that cannot build a schedule. Other schedules and the queue keep running. Database read errors stop the pass rather than being attributed to a row. `schedule_row_skipped` carries `schedule_pk`, the name when readable, `fields` and `reason`. Reporting is once, then at most once a minute per row per worker. Locked dispatch skips include a traceback only on the first line. Rows whose `enabled` value can be read as false are skipped without a log line.
+
+PostgreSQL rejects infinite timestamps and dates outside Python's range. MySQL rejects zero dates, zero months or days, and `enabled` outside 0 and 1. SQLite rejects invalid dates, non-UTF-8 text, bytes in text columns, non-integer values in integer columns, and `enabled` outside 0 and 1. With `USE_TZ = False`, SQLite timestamps with offsets are also rejected. These rules apply regardless of driver. SQL NULL `end_time` still means the schedule never ends.
+
+All engines reject `boundary_generation` at its column's maximum: it reads, but cannot increase. SQL can seed one below the maximum. The next heal or API retime succeeds and reaches the maximum; subsequent worker reads skip the row and writes can refuse it. Lower the count with SQL, or delete the schedule and create it again. The API and admin cannot lower it.
 
 An unreadable change marker reports `schedule_source_unavailable` once,
 then at most once a minute. The worker reads the schedules in full at each
@@ -693,12 +694,10 @@ Worth knowing before you turn it on:
   indexed read of a small table.
 - **Marker reads and reconciles.** Workers read one change-marker row per pass. They re-read schedules when it changes and at `SCHEDULE_RECONCILE_INTERVAL`, normally 60 seconds. If the marker cannot be read, full reads still run at that interval. Stored schedule reads use more CPU than 1.8.0, and full reconciles now use batched queries. Reconciles do not run every tick. Latest tick decoding costs CPU each pass. Dispatch statement counts are unchanged, both with and without a due tick.
 - **Stored values django-ox cannot use.** Workers skip unreadable or invalid rows, including incomparable boundaries and a maximum `boundary_generation`; other schedules and the queue continue. `schedule_row_skipped` carries `schedule_pk`, `schedule`, `fields` and `reason`. An unreadable name may be `None`. Stored-value reasons name the field, quote its value and explain the problem. Reporting is once, then at most once a minute per row per worker. Locked dispatch skips include a traceback only on the first line.
-- **Skipped rows need repair.** Skipping does not repair invalid values. Find
-  the row by `schedule_pk` and correct it in the admin change form or with
-  `update_schedule`. Use SQL if the value is one the ORM cannot read. To pause
-  a readable row that no longer validates, use `update_schedule` with
-  `enabled=False`
-  alone. Enabling it again is refused until it is corrected.
+- **Skipped rows need repair.** Find the row by `schedule_pk`. Use its admin form when available, or pass replacements for every caller-writable unreadable field in one `update_schedule` call. A change writes `start_time`, `updated_at` and `boundary_for` afresh; do not supply them. A change leaving rejected values raises `StoredValueUnreadable` with `.fields` and writes nothing. Every successful repair establishes a fresh activation boundary and increments `boundary_generation`, even for an `updated_at`-only repair. Ticks due during the unreadable period are not fired afterwards.
+
+    Neither the API nor the admin can repair `created_at` or `boundary_generation`. Use SQL to replace unreadable values or lower a maximum count, or delete the schedule and create it again. To pause instead, call `update_schedule(OxSchedule(pk=pk), enabled=False)`. Pausing does not repair stored values; enabling remains refused until the row is corrected.
+
 - **Dispatch failures have a separate boundary.** A schedule can validate and
   still fail when dispatched. For any schedule source, a tick that cannot be
   derived or bounds that cannot be compared with the worker's clock are

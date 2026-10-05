@@ -627,18 +627,31 @@ class UnreadableRow:
     @property
     def reason(self) -> str:
         """Why the row did not read, in one line safe to print."""
-        if self.unreadable:
-            return "; ".join(f"{name} {why}" for name, why in self.unreadable.items())
+        return self._reason(self.unreadable)
+
+    def _reason(self, unreadable: Mapping[str, str]) -> str:
+        if unreadable:
+            return "; ".join(f"{name} {why}" for name, why in unreadable.items())
         return _UNKNOWN_FIELD.format(error=_error_text(self.cause))
 
-    def exception(self) -> StoredValueUnreadable:
-        """The StoredValueUnreadable that says so, with `cause` as its cause."""
+    def exception(self, fields: Collection[str] | None = None) -> StoredValueUnreadable:
+        """
+        The StoredValueUnreadable that says so, with `cause` as its cause.
+
+        `fields` narrows it to those of the fields that did not read, for a
+        caller that is replacing the others.
+        """
+        unreadable = (
+            self.unreadable
+            if fields is None
+            else {name: why for name, why in self.unreadable.items() if name in fields}
+        )
         exc = StoredValueUnreadable(
             alias=self.alias,
             model=OxSchedule._meta.label,
             pk=self.pk,
-            fields=self.fields,
-            reason=self.reason,
+            fields=tuple(unreadable),
+            reason=self._reason(unreadable),
         )
         exc.__cause__ = self.cause
         return exc
@@ -657,6 +670,32 @@ class UnreadableRow:
         ]
         return OxSchedule.from_db(self.alias, names, [self.values[n] for n in names])
 
+    def guarded_instance(self) -> OxSchedule:
+        """
+        `deferred_instance`, for a caller that hands the row to code it does
+        not control, such as a permission backend.
+
+        Reading a field that did not read does not ask a database. Django's
+        own load of a deferred field would, and it follows the routing of
+        reads, which can be a replica that holds another copy of the row.
+        Here it raises StoredValueUnreadable, naming the field, from the
+        row this was read from. The row is complete in every other respect:
+        everything that read is on it.
+        """
+        instance = self.deferred_instance()
+
+        def refresh_from_db(
+            using: str | None = None,
+            fields: Collection[str] | None = None,
+            **kwargs: Any,
+        ) -> None:
+            raise self.exception(fields)
+
+        # On the instance, where Django's deferred attribute finds it before
+        # the model's own method.
+        instance.__dict__["refresh_from_db"] = refresh_from_db
+        return instance
+
 
 def read_schedules(
     pks: Iterable[int] | QuerySet[OxSchedule],
@@ -673,6 +712,14 @@ def read_schedules(
     A key with no row is left out, so a caller can tell a row that is gone
     from one that does not read. In the order the keys were given.
 
+    A key is found as Django's own lookups find it, whatever it was written
+    as: `"7"`, as a URL or a form hands a key over, is row 7, and the row
+    is answered under the key the caller gave. A key compared as the value
+    it was written as would never equal the number the database returned,
+    and the row would be answered as gone: to a delete made for a user,
+    which asks nothing about a row that is gone and then deletes by a key
+    Django converts.
+
     A queryset is read for its primary keys alone, which always read, and
     then as keys: `_BATCH_SIZE` rows a statement, or as many as the
     connection takes parameters for where that is fewer. A batch that fails
@@ -685,7 +732,9 @@ def read_schedules(
 
     `lock` takes each row's lock as it reads it, where the database has row
     locks, for a read that has to be current. On SQLite it does nothing:
-    there `lock_schedule` is what serialises.
+    there `lock_schedule` is what serialises. Several rows are locked in
+    primary-key order, whatever order their keys were given in
+    (`lock_schedules` says why).
 
     `fields` names the fields to read, for a caller that needs those alone
     and must not depend on the rest of the row. The primary key is always
@@ -696,16 +745,35 @@ def read_schedules(
     """
     if isinstance(pks, QuerySet):
         pks = pks.values_list("pk", flat=True)
-    wanted = list(dict.fromkeys(pks))
+    # Each key as the caller wrote it, and as the database holds it.
+    asked = {pk: _held_key(pk) for pk in dict.fromkeys(pks)}
+    wanted = list(dict.fromkeys(asked.values()))
     selected = _selected(fields)
     # One parameter a key, and the statement has no other.
     limit = connections[using].features.max_query_params
     step = max(min(_BATCH_SIZE, limit) if limit else _BATCH_SIZE, 1)
+    # A locking read goes through the keys in their own order, a batch
+    # after a batch, and each statement hands its rows over in that order.
+    in_turn = sorted(wanted) if lock else wanted
     found: dict[int, OxSchedule | UnreadableRow] = {}
-    for start in range(0, len(wanted), step):
-        batch = wanted[start : start + step]
+    for start in range(0, len(in_turn), step):
+        batch = in_turn[start : start + step]
         found.update(_read_rows(batch, using, lock=lock, fields=selected))
-    return {pk: found[pk] for pk in wanted if pk in found}
+    return {pk: found[key] for pk, key in asked.items() if key in found}
+
+
+def _held_key(pk: Any) -> Any:
+    """
+    A primary key as the database holds it, whatever it was written as.
+
+    Converted by the key's own field, which is what converts it for every
+    lookup and delete Django makes by it, so the row read for a key is the
+    row those act on. A key that is no number raises here what it raises
+    there. One read from the database is its own answer.
+    """
+    if type(pk) is int:
+        return pk
+    return OxSchedule._meta.pk.get_prep_value(pk)
 
 
 def _selected(fields: Collection[str] | None) -> list[Field[Any, Any]]:
@@ -732,6 +800,10 @@ def _read_rows(
     query = OxSchedule.objects.using(using).filter(pk__in=pks)
     if lock and connections[using].features.has_select_for_update:
         query = query.select_for_update()
+        if len(pks) > 1:
+            # A row is locked as the statement comes to it, so the order
+            # the rows are locked in is the statement's. One row has none.
+            query = query.order_by("pk")
     try:
         fetched = _fetched(query, fields)
     except Exception as exc:
@@ -847,6 +919,50 @@ def lock_schedule(
     if not connection.features.has_select_for_update:
         OxSchedule.objects.using(using).filter(pk=pk).update(name=F("name"))
     return read_schedules([pk], using=using, lock=True, fields=fields).get(pk)
+
+
+def lock_schedules(
+    pks: Iterable[int], *, using: str, fields: Collection[str] | None = None
+) -> dict[int, OxSchedule | UnreadableRow]:
+    """
+    Take the row locks of several stored schedules and read each row under
+    its lock: every one that is there, by key, in primary-key order.
+
+    What `lock_schedule` does for one row, done for a selection in the
+    statements one row takes, for as many keys as one statement reads. On
+    PostgreSQL and MySQL a locking read, which waits for a concurrent
+    writer of any of the rows and reads each as that writer committed it.
+    On SQLite a no-op UPDATE comes first and names one key: any write makes
+    the transaction the writer, whether or not a row matches it, and being
+    the writer is what serialises there.
+
+    The locks are taken in primary-key order, whatever order the keys came
+    in. Two transactions that lock some of the same rows then meet at the
+    lowest key they share, and the one that waits there holds no lock on a
+    row the other has still to reach, so neither can be left waiting on the
+    other for ever.
+
+    A key with no row is left out, as `read_schedules` leaves it out, and
+    `fields` names what is read, as for `lock_schedule`. Each row is
+    answered under the key the database holds, a number, whatever its key
+    was written as, and the order the locks are taken in is the order of
+    those numbers.
+
+    Raises TransactionManagementError outside a transaction, where the
+    locks would be released as soon as they were taken.
+    """
+    connection = connections[using]
+    if connection.get_autocommit():
+        raise TransactionManagementError(
+            "lock_schedules() holds its locks until the end of the transaction, "
+            "and there is no transaction."
+        )
+    wanted = sorted({_held_key(pk) for pk in pks})
+    if not wanted:
+        return {}
+    if not connection.features.has_select_for_update:
+        OxSchedule.objects.using(using).filter(pk=wanted[0]).update(name=F("name"))
+    return read_schedules(wanted, using=using, lock=True, fields=fields)
 
 
 # -- the tick log -------------------------------------------------------------

@@ -18,7 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 from functools import partial
@@ -34,6 +34,7 @@ from django.core.exceptions import (
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import DatabaseError, DataError, connections, router, transaction
 from django.db.models import F, Field, IntegerField
+from django.db.models.deletion import Collector
 from django.utils import timezone
 
 from . import registry
@@ -41,10 +42,12 @@ from ._stored_read import (
     UnreadableRow,
     is_unreadable_value,
     lock_schedule,
+    lock_schedules,
     read_schedules,
 )
 from .compat import normalize_json
 from .cron import CronExpression
+from .exceptions import StoredValueUnreadable
 from .models import OxSchedule, OxScheduleChange, validate_against, validation_alias
 from .schedules import MAX_INTERVAL, STORED_KEY_PREFIX, lock_contention
 
@@ -254,6 +257,58 @@ _ROW_REFUSED_AT_THE_CHECK = (
     "rows in this batch have been written."
 )
 
+# Messages for a stored row that holds a value that cannot be read, all of
+# them in this block: what `update_schedule` says when it cannot change
+# such a row, and what it logs when it has. With them, what the write
+# functions say of a row whose task key reads and is not registered here.
+
+#: The note on the StoredValueUnreadable `update_schedule` raises when the
+#: row keeps a value that does not read and that the caller could replace.
+#: `fields` names those fields.
+_REPLACE_TO_REPAIR = (
+    "Pass a new value for {fields} in the same update_schedule() call to "
+    "replace it, or pause the schedule with update_schedule(schedule, "
+    "enabled=False)."
+)
+#: The same, for a value only django_ox.stored writes and cannot write
+#: again without reading it first. `fields` names those fields.
+_CANNOT_BE_REPLACED = (
+    "{fields} is written only by django_ox.stored, which cannot write it "
+    "again without reading it. Pause the schedule with "
+    "update_schedule(schedule, enabled=False), or delete it with "
+    "delete_schedule()."
+)
+#: PermissionDenied for a row whose task key does not read, to a `user`
+#: who is not a superuser. `pk` is the row's primary key.
+_TASK_KEY_UNREADABLE = (
+    "Schedule {pk}'s task key cannot be read, so the permission its registry "
+    "entry requires is unknown. Only a superuser, or a call made without "
+    "user, can change or delete it."
+)
+#: The same, for a row whose task key reads and names no entry of this
+#: process's registry. `task_key` is the key as stored, quoted and made safe
+#: to print. Not "does not exist": during a rolling deploy it may be one only
+#: newer code registers.
+_TASK_KEY_UNREGISTERED = (
+    "Schedule {pk}'s task key {task_key} is not registered as a schedulable "
+    "task in this deployment, so the permission its registry entry requires "
+    "is unknown. Only a superuser, or a call made without user, can change or "
+    "delete it."
+)
+#: The line logged once a row that held a value that did not read has been
+#: paused or changed. The row's primary key, its alias, the fields that did
+#: not read, what was done ("paused" or "changed"), and the fields written.
+#: Names only: a value that did not read is not one to print.
+_UNREADABLE_ROW_WRITTEN = (
+    "Stored schedule pk %s on database %r held unreadable values in %s; it was "
+    "%s, writing %s."
+)
+#: What was done, as the record's `operation` key carries it: the two
+#: values a filter or an alert can be written against, whatever the line
+#: above comes to say.
+_PAUSED = "paused"
+_CHANGED = "changed"
+
 
 #: While a stored row keeps being left out, the change marker keeps being
 #: unreadable, or a row's boundary keeps failing to move, a worker says so
@@ -414,8 +469,13 @@ def stored_value(schedule: OxSchedule, field: str) -> Any:
     subclass is collapsed to `str` as well, because `to_python` returns a
     choices member unchanged and only its `repr` gives it away.
     """
+    return _as_stored(field, getattr(schedule, field))
+
+
+def _as_stored(field: str, value: Any) -> Any:
+    """`value` as the column `field` will hold it; `stored_value` says why."""
     model_field = cast("Field[Any, Any]", OxSchedule._meta.get_field(field))
-    value = model_field.to_python(getattr(schedule, field))
+    value = model_field.to_python(value)
     return str(value) if isinstance(value, str) else value
 
 
@@ -699,7 +759,12 @@ def validate_schedule(schedule: OxSchedule) -> None:
         raise ValidationError(found)
 
 
-def check_permission(schedule: OxSchedule, user: Any) -> None:
+def check_permission(
+    schedule: OxSchedule,
+    user: Any,
+    *,
+    whole: Callable[[], OxSchedule] | None = None,
+) -> None:
     """
     Enforce a registry entry's own permission, if it declares one.
 
@@ -710,15 +775,27 @@ def check_permission(schedule: OxSchedule, user: Any) -> None:
     Django's per-action admin permission hook takes no object, so this
     cannot ride on it; the shape is borrowed instead, and object-level
     backends get their chance because the schedule is passed through.
+
+    The permission held model-wide settles it without a backend being asked
+    about the row. Otherwise the row is what the backend decides by. When
+    `schedule` is only part of a row, `whole` returns the row as the
+    database holds it, read when it is needed and not before. A field of
+    it that does not read raises StoredValueUnreadable where the backend
+    touches it, and that is a refusal: a backend that cannot see the value
+    its decision rests on has not granted the permission.
     """
     kind = registry.kinds().get(schedule.task_key)
     if kind is None or kind.permission is None:
         return
     if user is None:
         return
-    if not user.has_perm(kind.permission, schedule) and not user.has_perm(
-        kind.permission
-    ):
+    if user.has_perm(kind.permission):
+        return
+    try:
+        granted = user.has_perm(kind.permission, schedule if whole is None else whole())
+    except StoredValueUnreadable:
+        granted = False
+    if not granted:
         raise PermissionDenied(
             f"Scheduling {schedule.task_key!r} needs the "
             f"{kind.permission!r} permission."
@@ -1049,6 +1126,20 @@ def update_schedule(
     `enabled=False` given alone pauses the schedule without validating the
     rest of it (`_disable`), so a row that no longer validates can still be
     stopped. Anything else, enabling it again included, is validated.
+
+    Only `schedule`'s primary key is read, so `OxSchedule(pk=...)` will do
+    for a row Django cannot load. A row holding a value that cannot be
+    read, written around this module, is changed only when this call
+    replaces every such value or is the one that writes it: the start time,
+    which a change to such a row sets afresh as a retime does, the digest
+    and `updated_at`. Otherwise StoredValueUnreadable names what is left,
+    and nothing is written. A value given here that its field refuses is a
+    ValidationError against that field, as one the rules refuse is.
+
+    Returns `schedule`, read back. If the row still holds a value that
+    cannot be read, an OxSchedule holding the fields that do is returned
+    in its place, the rest deferred: reading one of those raises, as
+    Django's own read of the row does.
     """
     _only_writable(fields, WRITABLE_FIELDS, "update_schedule")
     if _disables_only(fields):
@@ -1064,9 +1155,14 @@ def update_schedule(
         # instance let a caller holding a stale copy write an old
         # start_time over a newer one, undoing a resume someone else had
         # just made.
-        current = _lock_row(schedule.pk, alias)
-        if current is None:
+        found = _lock_by_key(schedule.pk, alias)
+        if found is None:
             raise OxSchedule.DoesNotExist(f"Schedule {schedule.pk} no longer exists.")
+        current, unread = _snapshot(found)
+        # Whoever may change the row as it stands, before anything about the
+        # change is looked at. The row as it will be is asked about below: a
+        # task key put right in this call is not what authorizes it.
+        _may_change(current, unread, user, partial(_whole, found))
         # The clock once the lock is held, not before the wait for it. The
         # boundary this call may write is the moment of the change, and the
         # change is not made until the row is locked: a dispatcher that
@@ -1074,25 +1170,48 @@ def update_schedule(
         # instant the new definition also contains, admits it against the
         # boundary, and a boundary from before the wait lets it through.
         now = timezone.now()
+        kept = unread - fields.keys() - _WRITTEN_HERE
+        if kept:
+            raise _cannot_change(found, kept)
         # The values as the database holds them, before this call's changes.
         # Taken from the locked row rather than from the caller's instance,
-        # which may be minutes old.
-        previous = {field: stored_value(current, field) for field in TIMING_FIELDS}
-        previously_enabled = current.enabled
-        stale_boundary = current.boundary_for != boundary_digest(current)
+        # which may be minutes old. Not for a row that held a value that did
+        # not read: what it held is not known, so nothing can be said to be
+        # unchanged, and it is given a fresh boundary below.
+        known = not unread
+        if known:
+            previous = {field: stored_value(current, field) for field in TIMING_FIELDS}
+            previously_enabled = current.enabled
+            stale_boundary = current.boundary_for != boundary_digest(current)
 
         # Only the fields this call was given. Everything else keeps the
         # value the database holds now, not the value the caller last saw.
         for name, value in fields.items():
             setattr(current, name, value)
-
-        retimed = any(
-            stored_value(current, field) != previous[field] for field in TIMING_FIELDS
-        )
-        resumed = current.enabled and not previously_enabled
-        # stale_boundary: the timing had already changed by a route that did
-        # not move the boundary, so it is stale whatever this call changes.
-        if retimed or resumed or stale_boundary:
+        if "start_time" in unread:
+            # Set before anything validates the row, which reads it.
+            current.start_time = now
+        current.updated_at = now
+        # Each value to be compared as its column will hold it, before it is
+        # compared with anything. One its field refuses is the caller's to
+        # correct, and is reported against its field with whatever else the
+        # row's validation finds, rather than raised from the comparison.
+        refused = _refused(fields)
+        if refused:
+            raise ValidationError(_errors_beside(current, alias, refused))
+        fresh = not known
+        if known:
+            retimed = any(
+                stored_value(current, field) != previous[field]
+                for field in TIMING_FIELDS
+            )
+            resumed = stored_value(current, "enabled") and not previously_enabled
+            # stale_boundary: the timing had already changed by a route that
+            # did not move the boundary, so it is stale whatever this call
+            # changes.
+            fresh = retimed or resumed or stale_boundary
+        written = [*fields, "updated_at", "boundary_for"]
+        if fresh:
             current.start_time = now
             # Counted here and nowhere else in this function: a call that
             # changes nothing the boundary is for rewrites boundary_for to
@@ -1101,27 +1220,266 @@ def update_schedule(
             # pending heal. Under this row's lock, so the read the
             # increment is computed from cannot move under it.
             current.boundary_generation = F("boundary_generation") + 1
-        current.updated_at = now
+            written += ["start_time", "boundary_generation"]
         with validate_against(alias):
-            current.full_clean(
-                exclude=[
-                    "boundary_for",
-                    "boundary_generation",
-                    "created_at",
-                    "updated_at",
-                ]
-            )
+            current.full_clean(exclude=_NOT_CLEANED)
         # After the clean, so the digest is over the values that will be stored.
         current.boundary_for = boundary_digest(current)
         check_permission(current, user)
-        current.save(using=alias)
+        # What this call changed and nothing else. The rest of the row is
+        # as the database holds it, and a value in it that does not read
+        # is not one to write back.
+        current.save(using=alias, update_fields=written)
         _touch_change_row(alias)
-    # The caller's instance is the one they will read from next. Read back
-    # from the alias this call wrote to: unqualified it follows
-    # db_for_read, and a replica that is behind either hands the caller the
-    # values it has just replaced or, for a row younger than its snapshot,
-    # raises DoesNotExist on a write that succeeded.
-    schedule.refresh_from_db(using=alias)
+        if unread:
+            _report_written(found.pk, alias, unread, _CHANGED, written)
+    return _read_back(schedule, alias)
+
+
+#: The columns a change to a row writes values of its own into, so that a
+#: value in them that does not read is replaced rather than read: the
+#: timestamp of the change, and the boundary and the digest of what it was
+#: set for, which a change to such a row sets afresh. The count of boundary
+#: writes is not among them, since a count is moved on from what it was.
+_WRITTEN_HERE = frozenset({"updated_at", "start_time", "boundary_for"})
+
+#: The columns only this module writes. One that does not read cannot be
+#: replaced by a caller, so the error says what can be done instead.
+_KEPT_BY_THIS_MODULE = frozenset(
+    {"boundary_for", "boundary_generation", "created_at", "start_time", "updated_at"}
+)
+
+
+def _snapshot(
+    found: OxSchedule | UnreadableRow, fields: Collection[str] | None = None
+) -> tuple[OxSchedule, set[str]]:
+    """
+    A locked row as an instance, and the names of its fields that did not read.
+
+    A row that reads is its own instance. One that does not is the fields
+    that did, the rest deferred: touching one of those is Django's own read
+    of it, which raises or misreads, so the callers here only set them.
+
+    `fields` is what the row was read for, where that was not all of it. A
+    field outside them was not read at all, which says nothing about
+    whether it would: it is deferred on the instance, and is not named.
+    """
+    if isinstance(found, OxSchedule):
+        return found, set()
+    instance = found.deferred_instance()
+    unread = {
+        model_field.name
+        for model_field in OxSchedule._meta.concrete_fields
+        if model_field.attname not in found.values
+        and (fields is None or model_field.name in fields)
+    }
+    return instance, unread | set(found.unreadable)
+
+
+def _whole(found: OxSchedule | UnreadableRow) -> OxSchedule:
+    """
+    A row read in full as an instance a permission backend can be handed:
+    the row itself where it read, and otherwise the fields that did, with
+    reading any other raising StoredValueUnreadable.
+    """
+    return found if isinstance(found, OxSchedule) else found.guarded_instance()
+
+
+def _whole_row(pk: int, db_alias: str) -> OxSchedule:
+    """
+    The row in full, from the write alias, under the lock the caller holds.
+
+    For a caller that read only a few of its columns and now has to hand
+    the row to code that may touch any of them. One more locking read,
+    which is the row as it stands and not a replica's copy of it.
+    """
+    found = lock_schedule(pk, using=db_alias)
+    if found is None:
+        raise OxSchedule.DoesNotExist(f"Schedule {pk} no longer exists.")
+    return _whole(found)
+
+
+def _may_change(
+    current: OxSchedule,
+    unread: set[str],
+    user: Any,
+    whole: Callable[[], OxSchedule],
+) -> None:
+    """
+    Check whether `user` may change or delete the row as it stands, using
+    its task registry entry.
+
+    An unreadable task key or a key not registered in this process names no
+    entry. Its required permission is unknown; this does not mean that no
+    permission is required. With `user` supplied, only an active superuser
+    may change or delete such a row. Trusted application code may call
+    without a user. No object-level permission check is possible without a
+    registry entry naming the permission.
+
+    Read the stored task key under the row's lock. The caller checks
+    permission for the proposed task separately.
+
+    `current` may contain only some columns. A model-wide grant of the
+    registry permission needs no further read. Otherwise, `whole` reads the
+    complete row from the write alias under the same lock for the
+    object-level backend. Accessing a field that did not read raises
+    StoredValueUnreadable and refuses permission.
+    """
+    if user is None:
+        return
+    if "task_key" in unread:
+        unknown = _TASK_KEY_UNREADABLE.format(pk=current.pk)
+    elif current.task_key not in registry.kinds():
+        unknown = _TASK_KEY_UNREGISTERED.format(
+            pk=current.pk, task_key=_printable(repr(current.task_key))
+        )
+    else:
+        check_permission(current, user, whole=whole)
+        return
+    if getattr(user, "is_active", False) and getattr(user, "is_superuser", False):
+        return
+    raise PermissionDenied(unknown)
+
+
+def _refused(fields: Mapping[str, Any]) -> dict[str, list[ValidationError]]:
+    """
+    Each value given for a column the boundary is for that its field will
+    not take, with the field's error. Those are the values compared with
+    the row's before the row is validated; any other is left to that.
+    """
+    refused = {}
+    for name, value in fields.items():
+        if name not in BOUNDARY_FIELDS:
+            continue
+        try:
+            _as_stored(name, value)
+        except ValidationError as exc:
+            refused[name] = exc.error_list
+    return refused
+
+
+def _errors_beside(
+    current: OxSchedule, alias: str, refused: dict[str, list[ValidationError]]
+) -> dict[str, list[ValidationError]]:
+    """
+    Everything validation finds wrong with the row as given, by field.
+
+    The fields' own errors for the values in `refused` are among what the
+    clean finds; each is kept as its field gave it, code and params
+    included, and said once.
+    """
+    errors: dict[str, list[ValidationError]] = {}
+    try:
+        with validate_against(alias):
+            current.full_clean(exclude=_NOT_CLEANED)
+    except ValidationError as exc:
+        errors = exc.update_error_dict(errors)
+    for name, found in refused.items():
+        errors.setdefault(name, found)
+    return errors
+
+
+def _cannot_change(
+    found: OxSchedule | UnreadableRow, kept: set[str]
+) -> StoredValueUnreadable:
+    """The StoredValueUnreadable for the values a change would have kept."""
+    fields = [
+        model_field.name
+        for model_field in OxSchedule._meta.concrete_fields
+        if model_field.name in kept
+    ]
+    exc = cast(UnreadableRow, found).exception(fields=fields)
+    replaceable = [name for name in fields if name not in _KEPT_BY_THIS_MODULE]
+    if replaceable:
+        exc.add_note(_REPLACE_TO_REPAIR.format(fields=", ".join(replaceable)))
+    if len(replaceable) < len(fields):
+        own = [name for name in fields if name in _KEPT_BY_THIS_MODULE]
+        exc.add_note(_CANNOT_BE_REPLACED.format(fields=", ".join(own)))
+    return exc
+
+
+def _report_written(
+    pk: int, alias: str, unread: set[str], done: str, written: Iterable[str]
+) -> None:
+    """
+    Log, once the change commits, that a row that did not read was written.
+
+    On commit, so that a caller's transaction that rolls back takes the line
+    with it, as it takes the write. A pause calls this once its own block
+    has ended: inside a caller's transaction that is still before the
+    commit, and with none open the change is committed and the line is
+    written at once.
+    """
+    names = [
+        model_field.name
+        for model_field in OxSchedule._meta.concrete_fields
+        if model_field.name in unread
+    ]
+    fields = sorted(set(written))
+
+    def report() -> None:
+        logger.info(
+            _UNREADABLE_ROW_WRITTEN,
+            pk,
+            alias,
+            ", ".join(names),
+            done,
+            ", ".join(fields),
+            extra={
+                "event": "schedule_unreadable_row_written",
+                "schedule_pk": pk,
+                "database": alias,
+                "operation": done,
+                "written_fields": fields,
+            },
+        )
+
+    connection = connections[alias]
+    if connection.in_atomic_block or connection.get_autocommit():
+        transaction.on_commit(report, using=alias)
+        return
+    # Autocommit is off and no block is open: the transaction is the
+    # caller's to end by hand. Django takes a hook for that commit only
+    # from inside a block, and this one sends the database nothing.
+    with transaction.atomic(using=alias, savepoint=False):
+        transaction.on_commit(report, using=alias)
+
+
+def _read_back(schedule: OxSchedule, alias: str) -> OxSchedule:
+    """
+    The row as the change left it, onto the caller's instance where it reads.
+
+    A row that still holds a value that does not read cannot be put on the
+    caller's instance, so the fields that read come back on one of its own.
+    """
+    return _handed_back(schedule, _as_written(schedule.pk, alias), alias)
+
+
+def _as_written(pk: int, alias: str) -> OxSchedule | UnreadableRow:
+    """
+    The whole row as a change has just left it, or what of it does not read.
+
+    From the alias the change was written to: unqualified a read follows
+    db_for_read, and a replica that is behind either hands the caller the
+    values it has just replaced or, for a row younger than its snapshot,
+    raises DoesNotExist on a write that succeeded.
+    """
+    found = read_schedules([pk], using=alias).get(pk)
+    if found is None:
+        raise OxSchedule.DoesNotExist(f"Schedule {pk} no longer exists.")
+    return found
+
+
+def _handed_back(
+    schedule: OxSchedule, found: OxSchedule | UnreadableRow, alias: str
+) -> OxSchedule:
+    """A row read back, as the write functions return it (`_read_back`)."""
+    if isinstance(found, UnreadableRow):
+        return found.deferred_instance()
+    for model_field in OxSchedule._meta.concrete_fields:
+        setattr(schedule, model_field.attname, getattr(found, model_field.attname))
+    schedule._state.db = alias
+    schedule._state.adding = False
     return schedule
 
 
@@ -1136,6 +1494,16 @@ def _disables_only(fields: Mapping[str, Any]) -> bool:
         return False
 
 
+#: What a pause reads of the row it pauses, and all it reads: the task key,
+#: which is what the registry's permission is asked by, and the columns the
+#: boundary is kept in and taken over. The row's name, its arguments, its
+#: bounds and its timestamps are not selected, so a value in one of them
+#: that does not read neither stops a pause nor is looked at by it.
+_READ_TO_PAUSE = frozenset(
+    BOUNDARY_FIELDS | {"task_key", "boundary_for", "boundary_generation"}
+)
+
+
 def _disable(schedule: OxSchedule, *, user: Any = None) -> OxSchedule:
     """
     Pause a stored schedule without asking whether the rest of it is valid.
@@ -1147,80 +1515,216 @@ def _disable(schedule: OxSchedule, *, user: Any = None) -> OxSchedule:
     to delete them. Nothing else changes here, so nothing else is checked;
     enabling the row again, or any other change, is validated in full.
 
+    That holds for a row holding a value that cannot be read, too. Under
+    the row's lock a pause reads the few values it needs (`_READ_TO_PAUSE`)
+    and selects no other column, so a value that does not read anywhere
+    else in the row is not one this needs, and is not met. Among the ones
+    it reads, each is decoded on its own. The boundary is moved only where
+    every value the digest is taken over reads: a digest of timing that did
+    not read would be made up. The count of boundary writes is moved
+    instead, so a worker holding a heal from before the pause does not
+    heal over it.
+
     Otherwise as `update_schedule`: under the row's lock, authorized by the
     task's registry permission, the boundary handled the way a pause
-    handles it, and the workers told.
+    handles it, and the workers told. A backend that decides by the row is
+    handed it in full, as `delete_schedule` hands it, though the pause itself
+    reads the few columns above.
     """
     alias = schedule_db_alias()
     with transaction.atomic(using=alias):
-        current = _lock_row(schedule.pk, alias)
-        if current is None:
+        found = _lock_by_key(schedule.pk, alias, _READ_TO_PAUSE)
+        if found is None:
             raise OxSchedule.DoesNotExist(f"Schedule {schedule.pk} no longer exists.")
-        check_permission(current, user)
+        current, unread = _snapshot(found, _READ_TO_PAUSE)
+        _may_change(current, unread, user, partial(_whole_row, schedule.pk, alias))
         now = timezone.now()
         written = ["enabled", "updated_at"]
-        try:
-            # The digest over values the field cannot convert raises; such
-            # a row cannot be built, so its boundary is left as it stands.
-            stale_boundary = current.boundary_for != boundary_digest(current)
-            current.enabled = False
-            digest: str | None = boundary_digest(current)
-        except (ValidationError, ArithmeticError, TypeError, ValueError):
-            current.enabled = False
-            stale_boundary, digest = False, None
-        if stale_boundary:
+        timing_read = not TIMING_FIELDS & unread
+        # A boundary over an `enabled` or a digest that did not read is one
+        # this cannot say is current, so it is moved as a stale one is.
+        stale_boundary = timing_read and (
+            bool({"enabled", "boundary_for"} & unread)
+            or current.boundary_for != boundary_digest(current)
+        )
+        current.enabled = False
+        digest = boundary_digest(current) if timing_read else None
+        counted = "boundary_generation" not in unread
+        if stale_boundary and counted:
             # As update_schedule does: the timing had moved by a route that
             # did not move the boundary, so it is stale whatever this
             # changes, and the write moves it.
             current.start_time = now
             current.boundary_generation = F("boundary_generation") + 1
             written += ["start_time", "boundary_generation"]
+        elif stale_boundary:
+            # A boundary moved without the count moving is one a worker
+            # cannot tell was moved, so it stays as it stands, digest and all.
+            digest = None
+        elif unread and counted:
+            current.boundary_generation = F("boundary_generation") + 1
+            written.append("boundary_generation")
         if digest is not None:
             current.boundary_for = digest
             written.append("boundary_for")
         current.updated_at = now
         current.save(using=alias, update_fields=written)
         _touch_change_row(alias)
-    schedule.refresh_from_db(using=alias)
-    return schedule
+    # Its own block has ended before anything else of the row is read: a
+    # pause stands whatever the rest of the row holds. What else of it does
+    # not read, the pause did not look at, and the row as it is handed back
+    # says. It is reported with both, or with what it met under the lock if
+    # the row cannot be read back.
+    try:
+        after = _as_written(schedule.pk, alias)
+        if isinstance(after, UnreadableRow):
+            unread |= _snapshot(after)[1]
+    finally:
+        if unread:
+            _report_written(schedule.pk, alias, unread, _PAUSED, written)
+    return _handed_back(schedule, after, alias)
 
 
-def delete_schedule(schedule: OxSchedule) -> None:
+#: What a delete made for a user reads of the row it deletes, and all it
+#: reads: the task key, which is what the registry's permission is asked by.
+_READ_TO_DELETE = frozenset({"task_key"})
+
+
+def delete_schedule(schedule: OxSchedule, *, user: Any = None) -> None:
     """
     Delete a stored schedule and tell the workers.
 
-    A plain delete() leaves every running worker holding the schedule until
-    something else changes, enqueueing and rolling back once a pass.
+    A plain delete() leaves running workers holding the schedule until
+    another change, enqueueing and rolling back once per pass.
+
+    Delete by `schedule`'s primary key. `OxSchedule(pk=...)` is sufficient
+    for a row Django cannot load; unreadable stored values do not prevent
+    deletion.
+
+    With `user` supplied, check the registry permission for the stored task
+    key, read under the row's lock. A task key changed on the caller's
+    instance does not authorize deletion. If the stored key cannot be read
+    or is not registered in this process, only an active superuser may
+    delete the row. An absent row needs no permission check.
+
+    Without `user`, the call is trusted application code: no permission
+    check or read of the row is made.
+
+    A model-wide grant of the registry permission needs no further check.
+    Otherwise, pass the complete row to the object-level backend, read from
+    the write alias under the same lock. Accessing an unreadable field
+    raises StoredValueUnreadable and refuses permission.
     """
     alias = schedule_db_alias()
     with transaction.atomic(using=alias):
+        if user is not None:
+            found = _lock_by_key(schedule.pk, alias, _READ_TO_DELETE)
+            if found is not None:
+                _may_change(
+                    *_snapshot(found, _READ_TO_DELETE),
+                    user,
+                    partial(_whole_row, schedule.pk, alias),
+                )
         schedule.delete(using=alias)
         _touch_change_row(alias)
 
 
-def _lock_row(pk: int, db_alias: str) -> OxSchedule | None:
+def _delete_schedules(
+    schedules: Iterable[OxSchedule], *, user: Any = None, origin: Any = None
+) -> None:
     """
-    Take this schedule's row lock and return the row as it stands.
+    Delete several stored schedules together, and tell the workers once.
 
-    On PostgreSQL and MySQL a locking read is a current read: it waits for
-    a concurrent writer, then reads the committed row rather than the
-    transaction's snapshot.
+    `delete_schedule` for a selection, for the admin's "Delete selected".
+    Called once a row, that takes a lock, a delete and a write to the change
+    marker for every row selected; this takes one of each for all of them.
+    Not public: `delete_schedule` is the function a caller deletes a
+    schedule with.
 
-    SQLite has neither row locks nor `SELECT ... FOR UPDATE`, and Django
-    drops the clause there without raising, so a locking read alone holds
-    on two databases and does nothing at all on the third. What serialises
-    SQLite is being a writer, and a transaction that reads first starts as
-    a reader. The no-op UPDATE makes it a writer before it reads.
+    In one transaction, all of the rows or none. The rows are first locked
+    and read, their key and their task key alone, by one locking read for
+    as many rows as a statement reads, in primary-key order whatever order
+    `schedules` came in, so that two selections with rows in common cannot
+    be left waiting on each other.
+    With `user`, every row found is then asked what `delete_schedule` asks
+    of one: the permission of the registry entry the database's task key
+    names, and for a task key that does not read or is not registered here,
+    an active superuser. All of them are asked before anything is deleted.
+    The first that refuses raises PermissionDenied: no row has been deleted
+    by then, no delete signal sent and no worker told. A row that is
+    already gone has nothing to ask about. Without `user` nothing is asked.
 
-    Nothing here depends on a rowcount. Reading one would rest on Django
-    setting MySQL's FOUND_ROWS flag, and a project setting its own
-    client_flag would lose the guarantee with no error.
+    The rows then go as Django deletes instances, through its collector:
+    with whatever would be deleted with them, with `pre_delete` and
+    `post_delete` sent for each instance in `schedules`, and deleted by key
+    in the collector's own batches. Nothing of a row is read to do it, so a
+    value in one that cannot be read does not keep the row. An instance
+    whose row is gone goes to the collector with the rest, as
+    `delete_schedule` deletes its one whether or not the row is there:
+    nothing is deleted for it, and Django sends its signals all the same.
+    `origin` is what those signals carry as where the deletion came from,
+    a queryset for a deletion that began as one.
     """
-    rows = OxSchedule.objects.using(db_alias).filter(pk=pk)
-    if connections[db_alias].features.has_select_for_update:
-        return rows.select_for_update().first()
-    OxSchedule.objects.using(db_alias).filter(pk=pk).update(name=F("name"))
-    return rows.first()
+    instances = list(schedules)
+    if not instances:
+        return
+    alias = schedule_db_alias()
+    with transaction.atomic(using=alias):
+        locked = lock_schedules(
+            [instance.pk for instance in instances],
+            using=alias,
+            fields=_READ_TO_DELETE,
+        )
+        if user is not None:
+            # In full, for the rows a backend is asked about: one locking
+            # read for them all, the first time one is needed.
+            whole: dict[int, OxSchedule | UnreadableRow] = {}
+
+            def whole_of(pk: int) -> Callable[[], OxSchedule]:
+                def read() -> OxSchedule:
+                    if not whole:
+                        whole.update(lock_schedules(list(locked), using=alias))
+                    return _whole(whole[pk])
+
+                return read
+
+            for pk, found in locked.items():
+                _may_change(*_snapshot(found, _READ_TO_DELETE), user, whole_of(pk))
+        collector = Collector(using=alias, origin=origin)
+        collector.collect(instances)
+        collector.delete()
+        _touch_change_row(alias)
+
+
+def _lock_by_key(
+    pk: int, db_alias: str, fields: Collection[str] | None = None
+) -> OxSchedule | UnreadableRow | None:
+    """
+    Take this schedule's row lock and read the row under it, for the write
+    functions: the row, what of it did not read, or None when it is gone.
+
+    Locked and read as a worker's `_current_row` is, by
+    `_stored_read.lock_schedule`. On PostgreSQL and MySQL one locking read,
+    which waits for a concurrent writer and then reads the row as that
+    writer committed it rather than the transaction's snapshot. SQLite has
+    neither row locks nor `SELECT ... FOR UPDATE`, and Django drops the
+    clause there without raising; what serialises SQLite is being the
+    writer, so there a no-op UPDATE makes the transaction one before it
+    reads. Each value is decoded once the statement has answered, so one
+    that does not read is named rather than raised, and the row is locked
+    like any other, to be paused, changed or found unreadable.
+
+    `fields` names what the caller reads of the row, and no other column is
+    selected. A pause names the few it needs, and a value that does not
+    read elsewhere in the row is not its concern. Without `fields`, the
+    whole row, which a change has to validate.
+
+    The read takes no savepoint of its own. One the database itself
+    refuses is raised as it is and leaves through the write function's
+    transaction, which inside a caller's transaction is a savepoint the
+    caller's goes on from.
+    """
+    return lock_schedule(pk, using=db_alias, fields=fields)
 
 
 def _paused(row: UnreadableRow) -> bool:
@@ -1234,20 +1738,20 @@ def _current_row(pk: int, db_alias: str) -> OxSchedule | UnreadableRow | None:
     worker deciding whether to dispatch it or move its boundary: the row,
     what of it did not read, or None when it is gone.
 
-    Locked as `_lock_row` locks: a locking read on PostgreSQL and MySQL,
-    and on SQLite a no-op UPDATE first, which makes the transaction the
+    Locked by the read itself on PostgreSQL and MySQL, a locking read,
+    and on SQLite by a no-op UPDATE first, which makes the transaction the
     writer before it reads. Read as `_stored_read.read_schedules` reads,
     each value decoded rather than converted, so a value that does not
     read is reported by field instead of raised, and one SQLite's
     converters would read as something else (a start that is not a date
     read as None, an `enabled` of 2 read as False) does not read either.
 
-    The statements `_lock_row` sends and no more, on every dispatch of a
-    stored schedule: the one locking read, or on SQLite the UPDATE and
-    the read. No savepoint is taken around the read, and whether the row
-    is still there comes from the read itself, which leaves out a row
-    that is gone. A read the database refuses is raised as it is, for the
-    dispatch loop to roll this schedule back on.
+    The fewest statements that lock and read, since it runs on every
+    dispatch of a stored schedule: the one locking read, or on SQLite the
+    UPDATE and the read. No savepoint is taken around the read, and
+    whether the row is still there comes from the read itself, which
+    leaves out a row that is gone. A read the database refuses is raised
+    as it is, for the dispatch loop to roll this schedule back on.
     """
     return lock_schedule(pk, using=db_alias)
 

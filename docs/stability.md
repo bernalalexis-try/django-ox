@@ -95,14 +95,10 @@ export names this page does not list; those names are not public.
   `(args, kwargs)` call shape, the input-order return and the
   all-or-nothing write. `INSERT_CHUNK_SIZE` is exported for reading; its
   value may change.
-- **The exceptions** `django_ox.exceptions.TaskAbandoned`, recorded against
-  tasks whose worker stopped reporting with no attempts left (it records the
-  lost lease, not a cause of failure), and `django_ox.exceptions.TaskTimeout`,
-  a `TimeoutError` raised inside a sync task at its execution deadline and
-  recorded against a timed-out attempt. The timeout comes from the task's
-  own declaration, then its queue's `TASK_TIMEOUTS` entry, then
-  `TASK_TIMEOUT`. Async tasks are cancelled and their timeout is recorded
-  with `TaskTimeout`.
+- **The exceptions** `django_ox.exceptions.TaskAbandoned`, recorded when a worker stops reporting with no attempts left, identifies a lost lease rather than its cause. `django_ox.exceptions.TaskTimeout` is a `TimeoutError` raised inside a sync task at its execution deadline and recorded against the timed-out attempt. Timeout precedence is the task declaration, its queue's `TASK_TIMEOUTS` entry, then `TASK_TIMEOUT`. Async tasks are cancelled and their timeout is recorded with `TaskTimeout`.
+
+    `django_ox.exceptions.StoredValueUnreadable` is raised by `update_schedule` when a change would leave a stored value django-ox cannot use. Attributes are `alias`, `model`, `pk`, `fields` and `reason`. `model` is `"django_ox.OxSchedule"`; `fields` is a tuple, possibly empty; `reason` is escaped, bounded and one line. The original exception, when available, is `__cause__`; `__notes__` explains recovery. Attributes survive pickling. It is not a `django.db.DatabaseError`. Caller-input and readable validation failures remain `ValidationError`; database failures retain their exceptions. Direct ORM loading is outside this guarantee.
+
 - **The structured-log contract**: the event names and stable `extra` keys
   documented on the [Monitoring](monitoring.md) page. This includes the
   policy events and keys, even though the declaration API is provisional.

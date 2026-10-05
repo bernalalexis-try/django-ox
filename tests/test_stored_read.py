@@ -65,6 +65,7 @@ from django_ox._stored_read import (
     is_unreadable_value,
     latest_ticks,
     lock_schedule,
+    lock_schedules,
     newest_tick_pk,
     read_schedules,
     read_ticks,
@@ -1123,6 +1124,62 @@ class TestReadingRowsInBatches:
 
 
 @pytest.mark.django_db
+class TestAKeyWrittenAsSomethingOtherThanItsNumber:
+    """
+    A key reaches a caller from a URL or a form as text, and Django's own
+    lookups and deletes take it that way. The reader has to find the row
+    they would act on: a row answered as gone is one a delete made for a
+    user asks nothing about, and then deletes.
+    """
+
+    @pytest.mark.parametrize(
+        "written", [str, lambda pk: f" {pk} ", float], ids=["text", "padded", "float"]
+    )
+    def test_the_row_is_read_and_answered_under_the_key_as_written(self, written):
+        row = a_row("row")
+        key = written(row.pk)
+        assert OxSchedule.objects.filter(pk=key).exists()
+
+        found = read_schedules([key], using=ALIAS)
+
+        assert list(found) == [key]
+        assert_reads_as_django_does(found[key], row.pk)
+
+    def test_one_row_written_two_ways_is_read_once_and_answered_twice(self):
+        row, other = a_row("row"), a_row("other")
+        reads = Reads(SCHEDULES)
+
+        with connection.execute_wrapper(reads):
+            found = read_schedules([str(other.pk), row.pk, str(row.pk)], using=ALIAS)
+
+        assert reads.parameters == [2]
+        assert list(found) == [str(other.pk), row.pk, str(row.pk)]
+        assert found[row.pk] is found[str(row.pk)]
+        assert_reads_as_django_does(found[str(other.pk)], other.pk)
+
+    def test_a_key_with_no_row_is_left_out_however_it_is_written(self):
+        row = a_row("row")
+        gone = str(row.pk + 1000)
+
+        assert read_schedules([gone, str(row.pk)], using=ALIAS).keys() == {str(row.pk)}
+
+    def test_a_key_that_is_no_number_raises_what_a_lookup_by_it_raises(self):
+        with pytest.raises(ValueError, match="expected a number") as lookup:
+            list(OxSchedule.objects.filter(pk="seven"))
+        with pytest.raises(ValueError, match="expected a number") as read:
+            read_schedules(["seven"], using=ALIAS)
+        assert str(read.value) == str(lookup.value)
+
+    def test_the_locked_read_finds_the_row(self):
+        row = a_row("row")
+
+        with transaction.atomic():
+            locked = lock_schedule(str(row.pk), using=ALIAS)
+
+        assert_reads_as_django_does(locked, row.pk)
+
+
+@pytest.mark.django_db
 class TestReadingSomeOfTheFields:
     """
     A caller that names the fields it needs is handed those, and its read
@@ -1294,6 +1351,157 @@ def test_the_locked_read_needs_a_transaction():
 
     with pytest.raises(TransactionManagementError, match="there is no transaction"):
         lock_schedule(row.pk, using=ALIAS)
+
+
+@pytest.mark.django_db
+class TestTheLockedReadOfSeveralRows:
+    """
+    `lock_schedules` is `lock_schedule` for a selection: the rows locked and
+    read together, and locked in the order of their keys whatever order the
+    keys came in, so that two transactions locking some of the same rows
+    cannot each hold what the other waits for.
+    """
+
+    def test_reads_each_row_that_is_there_in_the_order_of_the_keys(self):
+        first, bad, last = a_row("first"), a_row("bad"), a_row("last")
+        column = corrupt(bad.pk)
+        gone = a_row("gone")
+        gone_pk = gone.pk
+        gone.delete()
+
+        with transaction.atomic():
+            found = lock_schedules(
+                [last.pk, gone_pk, bad.pk, first.pk, bad.pk], using=ALIAS
+            )
+
+        assert list(found) == [first.pk, bad.pk, last.pk]
+        assert_reads_as_django_does(found[first.pk], first.pk)
+        assert_reads_as_django_does(found[last.pk], last.pk)
+        assert isinstance(found[bad.pk], UnreadableRow)
+        assert found[bad.pk].fields == (column,)
+
+    def test_one_statement_locks_them_in_the_order_of_their_keys(self):
+        rows = [a_row(f"row-{i}") for i in range(4)]
+        keys = [rows[2].pk, rows[0].pk, rows[3].pk, rows[1].pk]
+        written = []
+
+        def writes(execute, sql, params, many, context):
+            if sql.lstrip().upper().startswith("UPDATE"):
+                written.append((sql, tuple(params or ())))
+            return execute(sql, params, many, context)
+
+        with (
+            transaction.atomic(),
+            connection.execute_wrapper(sent := Reads(SCHEDULES)),
+            connection.execute_wrapper(writes),
+        ):
+            found = lock_schedules(keys, using=ALIAS, fields=["task_key"])
+
+        assert list(found) == sorted(keys)
+        ((read, params),) = sent.sent
+        assert columns_read(read) == {"id", "task_key"}
+        assert sorted(params) == sorted(keys)
+        if connection.features.has_select_for_update:
+            assert "FOR UPDATE" in read
+            table, key = (connection.ops.quote_name(n) for n in (SCHEDULES, "id"))
+            order = read.split("ORDER BY")[1].split("FOR UPDATE")[0].strip()
+            assert order == f"{table}.{key} ASC"
+            assert written == []
+        else:
+            # SQLite: the transaction is made the writer first, by one
+            # no-op write that names the lowest key and no other.
+            assert "FOR UPDATE" not in read
+            ((_sql, named),) = written
+            assert named == (min(keys),)
+
+    def test_keys_written_as_text_are_locked_in_the_order_of_their_numbers(self):
+        # As a caller with keys from a URL or a form hands them over. 999
+        # before 1000: as text they sort the other way about.
+        for key in (999, 1000):
+            a_row(f"row-{key}", id=key)
+        written = []
+
+        def writes(execute, sql, params, many, context):
+            if sql.lstrip().upper().startswith("UPDATE"):
+                written.append(tuple(params or ()))
+            return execute(sql, params, many, context)
+
+        with (
+            transaction.atomic(),
+            connection.execute_wrapper(sent := Reads(SCHEDULES)),
+            connection.execute_wrapper(writes),
+        ):
+            found = lock_schedules(["1000", "999"], using=ALIAS, fields=["task_key"])
+
+        assert list(found) == [999, 1000]
+        ((_read, params),) = sent.sent
+        assert sorted(params) == [999, 1000]
+        if not connection.features.has_select_for_update:
+            assert written == [(999,)]
+
+    def test_one_row_is_locked_by_the_statement_it_always_was(self):
+        row = a_row("row")
+
+        with transaction.atomic(), connection.execute_wrapper(one := Reads(SCHEDULES)):
+            lock_schedule(row.pk, using=ALIAS)
+        with transaction.atomic(), connection.execute_wrapper(many := Reads(SCHEDULES)):
+            lock_schedules([row.pk], using=ALIAS)
+
+        ((alone, _),) = one.sent
+        ((of_several, _),) = many.sent
+        assert "ORDER BY" not in alone
+        assert of_several == alone
+
+    def test_more_keys_than_a_statement_takes_are_locked_batch_after_batch(
+        self, parameter_limit
+    ):
+        keys = many_rows(5)
+        parameter_limit(2)
+        shuffled = [keys[3], keys[0], keys[4], keys[2], keys[1]]
+
+        with transaction.atomic(), connection.execute_wrapper(sent := Reads(SCHEDULES)):
+            found = lock_schedules(shuffled, using=ALIAS)
+
+        assert list(found) == keys
+        # Each statement takes the next keys up, so the order holds across them.
+        assert [sorted(params) for _sql, params in sent.sent] == [
+            keys[0:2],
+            keys[2:4],
+            keys[4:5],
+        ]
+
+    def test_a_read_that_does_not_lock_keeps_the_order_it_was_given(self):
+        keys = many_rows(3)
+        shuffled = [keys[2], keys[0], keys[1]]
+
+        with connection.execute_wrapper(sent := Reads(SCHEDULES)):
+            found = read_schedules(shuffled, using=ALIAS)
+            in_a_transaction = None
+            with transaction.atomic():
+                in_a_transaction = read_schedules(shuffled, using=ALIAS, lock=True)
+
+        assert list(found) == shuffled
+        # Handed back in the order asked for, whatever order they were locked in.
+        assert list(in_a_transaction) == shuffled
+        plain, locking = (sql for sql, _params in sent.sent)
+        assert "ORDER BY" not in plain
+        assert ("ORDER BY" in locking) == connection.features.has_select_for_update
+
+    def test_no_key_is_no_statement(self):
+        with transaction.atomic(), CaptureQueriesContext(connection) as queries:
+            assert lock_schedules([], using=ALIAS) == {}
+
+        assert [
+            q["sql"] for q in queries.captured_queries if SCHEDULES in q["sql"]
+        ] == []
+
+
+@pytest.mark.django_db(transaction=True)
+def test_the_locked_read_of_several_rows_needs_a_transaction():
+    row = a_row("row")
+
+    with pytest.raises(TransactionManagementError, match="there is no transaction"):
+        lock_schedules([row.pk], using=ALIAS)
 
 
 @pytest.mark.django_db(transaction=True)

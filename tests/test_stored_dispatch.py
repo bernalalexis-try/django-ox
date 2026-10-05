@@ -1093,21 +1093,22 @@ class TestTheBoundaryIsTimedUnderTheLock:
 
         return base, at
 
-    def _lock_that_waits(self, monkeypatch, during_the_wait, lock="_lock_row"):
+    def _lock_that_waits(self, monkeypatch, during_the_wait, lock):
         """
-        The first lock taken runs `during_the_wait` before it is granted:
-        the write API's, or with `lock="_current_row"` a worker's.
+        The first lock taken runs `during_the_wait` before it is granted.
+        `lock` is the function that takes it: the write functions'
+        `_lock_by_key`, or a worker's `_current_row`.
         """
         from django_ox import stored
 
         lock_row = getattr(stored, lock)
         waited = {"done": False}
 
-        def lock_row_after_a_wait(pk, alias):
+        def lock_row_after_a_wait(pk, alias, *fields):
             if not waited["done"]:
                 waited["done"] = True
                 during_the_wait(pk)
-            return lock_row(pk, alias)
+            return lock_row(pk, alias, *fields)
 
         monkeypatch.setattr(stored, lock, lock_row_after_a_wait)
 
@@ -1125,7 +1126,7 @@ class TestTheBoundaryIsTimedUnderTheLock:
         row = a_minutely(cron="0 * * * *", start_time=base - timedelta(hours=2))
         at(-1800)
         worker._schedule_source.schedules()  # the old definition, cached
-        self._lock_that_waits(monkeypatch, lambda pk: at(1))
+        self._lock_that_waits(monkeypatch, lambda pk: at(1), lock="_lock_by_key")
         at(-1)
         update_schedule(row, cron="0,30 * * * *")
         row.refresh_from_db()
