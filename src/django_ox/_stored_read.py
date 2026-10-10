@@ -73,16 +73,20 @@ from django.db.models import (
     Func,
     IntegerField,
     Max,
+    OuterRef,
     QuerySet,
+    Subquery,
     TextField,
+    Value,
 )
-from django.db.models.functions import Cast
+from django.db.models.functions import Cast, Concat
 from django.db.transaction import TransactionManagementError
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
 from .exceptions import StoredValueUnreadable
 from .models import OxSchedule, OxScheduleTick
+from .schedules import STORED_KEY_PREFIX
 
 #: The most stored schedules one statement reads by key: enough that every
 #: row of a large table is read in a few statements, ten thousand rows in
@@ -91,6 +95,13 @@ from .models import OxSchedule, OxScheduleTick
 #: takes (`read_schedules`). Not a setting, and nothing outside this module
 #: depends on the number.
 _BATCH_SIZE = 500
+
+#: The parameters the statement of `newest_ticks` carries besides one for
+#: each schedule: the prefix of a stored schedule's tick key, which each of
+#: its two lookups puts in front of the primary key. A concatenation takes
+#: the prefix as three parameters on PostgreSQL and SQLite, where Django
+#: guards each side of it against NULL, and as one on MySQL.
+_KEY_PARAMETERS = 6
 
 #: How SQLite's driver reports text it cannot decode as UTF-8. It raises an
 #: OperationalError, the class of a database that failed, for one value in
@@ -981,7 +992,7 @@ class TickRead:
     One of three answers. A tick that reads: `at` is set. No tick at all,
     within what was asked: `absent`. A tick that does not read: `reason`
     says why, safe to print, and `pk` is the tick row's key where the read
-    that found it also found its key (`earliest_tick`).
+    that found it also found its key (`newest_ticks`, `earliest_tick`).
     `latest_ticks` does not look for it: `newest_tick_pk` does, for a caller
     that is about to name the row. An unreadable tick is not an absent one,
     and must not be taken for one.
@@ -1101,6 +1112,113 @@ def newest_tick_pk(
         if not can_read_on(exc, using=using):
             raise
         return None
+
+
+def newest_ticks(pks: Iterable[int], *, using: str) -> dict[int, TickRead]:
+    """
+    The newest tick of each stored schedule with these primary keys, by
+    primary key, over all of its history.
+
+    What a page of schedules shows as each one's last tick. One statement
+    for the page: for every listed schedule it looks up the newest row the
+    tick log holds under the schedule's key, which is the prefix and its
+    primary key, put together in the query. Each lookup is the last entry
+    of that key in the (schedule_name, scheduled_for) index, so the
+    statement costs a seek a schedule however long the history is. The
+    grouped read `latest_ticks` makes without a bound has to read every
+    tick of every key on PostgreSQL and SQLite, and is kept for the reads
+    that give it one.
+
+    The database picks the newest by its own ordering of the column, before
+    anything is decoded, and that row's primary key and its tick, as text,
+    are what is fetched. So there are three answers, and they stay apart:
+    no tick at all, `absent`; a newest tick that reads, `at`; and a newest
+    tick that does not read, `reason`, NULL among them. A newest tick that
+    does not read is never passed over for an older one that does: which
+    tick is the newest was settled before either was looked at.
+
+    A schedule that is gone is left out. Read in batches of `_BATCH_SIZE`,
+    or of what the connection takes parameters for. A statement that fails
+    as a whole, on a value the driver cannot hand over, is tried again with
+    half the schedules, down to one, while the connection is known to take
+    another statement (`can_read_on`); an error the database raised is
+    raised as it is.
+    """
+    wanted = list(dict.fromkeys(pks))
+    limit = connections[using].features.max_query_params
+    # One parameter a schedule, and those of the key's prefix.
+    room = limit - _KEY_PARAMETERS if limit else _BATCH_SIZE
+    step = max(min(_BATCH_SIZE, room), 1)
+    found: dict[int, TickRead] = {}
+    for start in range(0, len(wanted), step):
+        found.update(_newest(wanted[start : start + step], using))
+    return {pk: found[pk] for pk in wanted if pk in found}
+
+
+def _stored_key(pk: int) -> str:
+    """The key the tick log keeps a stored schedule's ticks under."""
+    return f"{STORED_KEY_PREFIX}{pk}"
+
+
+def _newest(pks: list[int], using: str) -> dict[int, TickRead]:
+    """One batch of schedules, or its halves when it does not read as a whole."""
+    # The schedule's key, made in the query from the row the lookup is for.
+    # The primary key goes into it as the number it is: cast to text first,
+    # MySQL gives the key a collation of its own, which it will not compare
+    # with a `schedule_name` column in another.
+    key = Concat(Value(STORED_KEY_PREFIX), OuterRef("pk"), output_field=CharField())
+    # Newest first, and by the key before that, which the lookup holds to
+    # one value: it changes nothing about which row is first, and is the
+    # index's own order, read from its end. Ordered by the tick alone,
+    # MySQL reads every tick of the key and sorts them.
+    newest = OxScheduleTick.objects.filter(schedule_name=key).order_by(
+        "-schedule_name", "-scheduled_for"
+    )
+    query = (
+        OxSchedule.objects.using(using)
+        .filter(pk__in=pks)
+        .annotate(
+            ox_stored_tick=Subquery(newest.values("pk")[:1]),
+            ox_stored_scheduled_for=Subquery(
+                newest.annotate(
+                    ox_stored_scheduled_for=as_text("scheduled_for")
+                ).values("ox_stored_scheduled_for")[:1],
+                output_field=TextField(),
+            ),
+        )
+        .values_list("pk", "ox_stored_tick", "ox_stored_scheduled_for")
+    )
+    try:
+        fetched = list(query)
+    except Exception as exc:
+        if not can_read_on(exc, using=using):
+            raise
+        if len(pks) == 1:
+            alone = _stored_key(pks[0])
+            return {
+                pks[0]: TickRead(
+                    alone,
+                    pk=newest_tick_pk(alone, using=using),
+                    reason=_fetch_failed(exc),
+                    cause=exc,
+                )
+            }
+        middle = len(pks) // 2
+        return {**_newest(pks[:middle], using), **_newest(pks[middle:], using)}
+    answers: dict[int, TickRead] = {}
+    for pk, tick_pk, text in fetched:
+        if tick_pk is None:
+            answers[pk] = TickRead(_stored_key(pk))
+            continue
+        try:
+            at = decode_datetime(text, using)
+        except UnreadableValue as exc:
+            answers[pk] = TickRead(
+                _stored_key(pk), pk=tick_pk, reason=f"scheduled_for {exc}", cause=exc
+            )
+        else:
+            answers[pk] = TickRead(_stored_key(pk), at=at, pk=tick_pk)
+    return answers
 
 
 @dataclass(frozen=True)

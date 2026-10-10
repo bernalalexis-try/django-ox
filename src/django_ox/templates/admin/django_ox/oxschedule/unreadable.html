@@ -1,0 +1,84 @@
+{% extends "admin/base_site.html" %}
+{% load i18n l10n admin_urls %}
+
+{% block bodyclass %}{{ block.super }} app-{{ opts.app_label }} model-{{ opts.model_name }} change-form{% endblock %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+&rsaquo; <a href="{% url opts|admin_urlname:'changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+&rsaquo; {{ subtitle }}
+</div>
+{% endblock %}
+
+{% block content %}
+  <div id="content-main">
+    <p>
+      This schedule holds a stored value django-ox cannot use. Its form and
+      history are unavailable here. The details below explain your recovery
+      options.
+    </p>
+    <table>
+      <tbody>
+        <tr><th scope="row">Primary key</th><td>{{ schedule.pk|unlocalize }}</td></tr>
+        <tr><th scope="row">Name</th><td>{% if name is None %}Unreadable stored value{% else %}{{ name }}{% endif %}</td></tr>
+        <tr><th scope="row">Task key</th><td>{% if task_key is None %}Unreadable stored value{% else %}{{ task_key }}{% endif %}</td></tr>
+      </tbody>
+    </table>
+    <h2>Stored values django-ox cannot use</h2>
+    <ul class="unreadable-fields">
+      {% for field, reason in problems %}
+        <li><strong>{{ field }}</strong>: {{ reason }}</li>
+      {% endfor %}
+    </ul>
+    {% if example %}
+      <p>
+        To repair it, call
+        <code>django_ox.stored.update_schedule(OxSchedule(pk={{ schedule.pk|unlocalize }}), {{ example }})</code>{% if replaced %}
+        with replacement values for all these fields in the same call:
+        {{ replaced|join:", " }}{% else %} with a value for the example
+        argument; its current value also works{% endif %}.
+        {% if rewritten %}Any change made this way writes
+        {{ rewritten|join:", " }} afresh.{% endif %} A repaired schedule
+        starts from the moment of the repair. Ticks that came due while its
+        stored values could not be read are not fired afterwards. If you
+        cannot make this API call, send these instructions to a developer.
+      </p>
+    {% else %}
+      <p>
+        {% if stuck %}Only django_ox.stored writes these fields:
+        {{ stuck|join:", " }}. Neither the API nor the admin can repair them.
+        Use SQL to replace unreadable values or lower boundary_generation if
+        it has reached its column's maximum. You can also delete the schedule
+        and create it again.{% else %}The read could not identify the field,
+        so this page cannot give repair instructions. Ask a developer to
+        investigate the read error shown above.{% endif %} You can pause or
+        delete the schedule, subject to permissions.
+      </p>
+    {% endif %}
+    <p>
+      To pause it, call
+      <code>django_ox.stored.update_schedule(OxSchedule(pk={{ schedule.pk|unlocalize }}), enabled=False)</code>.
+      If the Disable button is available below, it does the same. Pausing does
+      not repair the stored values.
+    </p>
+    {% url opts|admin_urlname:'changelist' as changelist_url %}
+    {% if can_disable or can_delete %}
+      <div class="submit-row">
+        {% if can_disable %}
+          <form method="post" action="{% add_preserved_filters changelist_url %}">{% csrf_token %}
+            <input type="hidden" name="action" value="disable_selected">
+            <input type="hidden" name="index" value="0">
+            <input type="hidden" name="{{ action_checkbox_name }}" value="{{ schedule.pk|unlocalize }}">
+            <input type="submit" value="Disable">
+          </form>
+        {% endif %}
+        {% if can_delete %}
+          {% url opts|admin_urlname:'delete' schedule.pk|admin_urlquote as delete_url %}
+          <a href="{% add_preserved_filters delete_url %}" class="deletelink">{% translate "Delete" %}</a>
+        {% endif %}
+      </div>
+    {% endif %}
+  </div>
+{% endblock %}

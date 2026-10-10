@@ -94,6 +94,8 @@ wait as long as a connection stays open without answering. Statements
 elsewhere can also wait without limit. This change adds no shutdown
 deadline.
 
+The stored-schedule reader changed for psycopg2 and mysqlclient; follow the [upgrade checks](stored-schedules.md#upgrade-checks) before upgrading.
+
 `Worker.run_once()` and `testing.run_tasks()` raise the claim's original
 error at once, without an immediate recovery attempt or a pending recovery
 read on the next call. A claim that committed stays `RUNNING` and is left

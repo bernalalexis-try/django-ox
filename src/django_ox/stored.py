@@ -1285,15 +1285,20 @@ def _whole(found: OxSchedule | UnreadableRow) -> OxSchedule:
     return found if isinstance(found, OxSchedule) else found.guarded_instance()
 
 
-def _whole_row(pk: int, db_alias: str) -> OxSchedule:
+def _whole_row(pk: int, db_alias: str, *, locked: bool = True) -> OxSchedule:
     """
     The row in full, from the write alias, under the lock the caller holds.
 
     For a caller that read only a few of its columns and now has to hand
     the row to code that may touch any of them. One more locking read,
-    which is the row as it stands and not a replica's copy of it.
+    which is the row as it stands and not a replica's copy of it. With
+    `locked` false, for a caller that holds no lock and asks as a page does,
+    the same read without the lock.
     """
-    found = lock_schedule(pk, using=db_alias)
+    if locked:
+        found = lock_schedule(pk, using=db_alias)
+    else:
+        found = read_schedules([pk], using=db_alias).get(pk)
     if found is None:
         raise OxSchedule.DoesNotExist(f"Schedule {pk} no longer exists.")
     return _whole(found)

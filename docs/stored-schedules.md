@@ -73,10 +73,21 @@ own, check that a backend's `OPTIONS` sets `SCHEDULE_SOURCE` to
 
 ## What a person with admin access can do
 
-They can pick a task from the list you exposed, set its timing and arguments,
-enable it, disable it, and run it once immediately. Disabling a readable row
-alone can pause it even if it no longer validates. This does not repair the row.
-Enabling it again is refused until it is corrected.
+They can pick an exposed task, set its timing and arguments, enable it, disable it, and run it once immediately. Disable can pause a row even when its stored values cannot be read or no longer validate. Pausing does not repair stored values. Enable and Run once refuse invalid rows, name them, and continue with the rest of the selection.
+
+The list keeps rows needing recovery in their positions and count, selectable by name or `pk N`. Timing shows "Stored values django-ox cannot use: {fields}"; an invalid enabled value shows "Invalid enabled value". Change and history pages show "Stored schedule needs recovery", with the primary key, name, task key, rejected fields, reasons and repair instructions. There is no form. Disable and Delete are available subject to permissions.
+
+Some rows keep their ordinary change, history and delete pages for users allowed to change them. Every unreadable value must be replaced by a form save, and Django must return it exactly as stored. Examples are SQLite text or fractions in integer timing fields, and MySQL `enabled = 2`. Unreadable timestamps and bytes in text columns always use recovery. The form warns about the values; a successful save replaces them and starts a fresh activation boundary.
+
+Disable pauses by primary key, tells workers and logs "Changed Enabled." Delete also works by primary key, tells workers and logs the deletion. Its confirmation identifies the schedule and explains that deletion does not require reading it. If a selected row disappears or becomes unauthorized before the write, the action counts it as skipped and continues with other rows.
+
+An unreadable newest tick displays "Unreadable tick history", never "never" or an older tick. The schedule can still be opened, edited, paused, enabled, run or deleted. Its change form, Enable and Run once warn that automatic dispatch may be blocked. They identify `ox_prune --purge-unreadable-ticks --schedule-key db:N`; follow the stop, preview, inspect and restart procedure under [Configuration](configuration.md#ox_prune).
+
+Times the active zone cannot display appear in UTC with a label, including after a timezone change. The form labels affected end-time inputs "End time (UTC)". Submitting an unchanged value preserves its instant; clearing it removes the end. If a save is refused after form validation, the error returns on the form without saving or logging a change. If the schedule was deleted meanwhile, Django reports that it does not exist.
+
+Schedule admin instances on the changelist and change form lack `get_queryset()` annotations, including `last_tick_at`. Adapt `list_display` and `readonly_fields` consumers before upgrading. Annotation ordering still selects the page.
+
+Fields named in subclass `fields` or `fieldsets` remain read-only for `start_time`, `created_at` and `updated_at`. Layouts built by an overridden `get_fieldsets()` are not inspected.
 
 Running one immediately ignores both the pause and the end time: a schedule
 that is disabled or past its `end_time` still runs.
@@ -733,6 +744,45 @@ Worth knowing before you turn it on:
   anything else in `transaction.on_commit`. A callback registered that way that
   raises, whatever it raises, is logged as `schedule_dispatch_callback_failed`;
   the task it followed is enqueued and counted.
+
+
+## Upgrade checks
+
+Before upgrading, check stored schedule boundaries and tick history if your application uses psycopg2 or mysqlclient. The reader now rejects PostgreSQL infinite timestamps and MySQL zero dates instead of decoding them as datetime endpoints or `None`. Those values cause schedules to be skipped. Use your actual table names; the queries use Django's defaults.
+
+With psycopg2, run these PostgreSQL checks for infinite values:
+
+```sql
+SELECT id FROM django_ox_oxschedule WHERE NOT isfinite(start_time) OR NOT isfinite(end_time);
+SELECT id FROM django_ox_oxscheduletick WHERE NOT isfinite(scheduled_for);
+```
+
+These PostgreSQL queries were validated on PostgreSQL 16 to identify infinite values.
+
+With mysqlclient, run these MySQL checks:
+
+```sql
+SELECT id FROM django_ox_oxschedule
+WHERE start_time IS NULL
+   OR CAST(start_time AS CHAR) REGEXP '(^0000-|^[0-9]{4}-00-|^[0-9]{4}-[0-9]{2}-00)'
+   OR CAST(end_time AS CHAR) REGEXP '(^0000-|^[0-9]{4}-00-|^[0-9]{4}-[0-9]{2}-00)'
+   OR DAY(start_time) > DAY(LAST_DAY(start_time))
+   OR DAY(end_time) > DAY(LAST_DAY(end_time));
+SELECT id FROM django_ox_oxscheduletick
+WHERE scheduled_for IS NULL
+   OR CAST(scheduled_for AS CHAR) REGEXP '(^0000-|^[0-9]{4}-00-|^[0-9]{4}-[0-9]{2}-00)'
+   OR DAY(scheduled_for) > DAY(LAST_DAY(scheduled_for));
+```
+
+These MySQL queries were validated on MySQL 8.4.11 with mysqlclient and PyMySQL, not on MySQL 8.0 or MariaDB.
+
+On SQLite, SQL-inserted bytes in text columns can cause schedules to be skipped. After upgrading, `schedule_row_skipped` identifies the row, `fields` and `reason`. These queries do not check SQLite. `ox_prune` keeps tick keys stored as bytes; removal requires `--tick-pk`.
+
+For an intended unbounded end, call `update_schedule(OxSchedule(pk=N), end_time=None)`. Replace an invalid start with an operator-chosen valid instant using SQL; do not treat it as absent.
+
+To remove unreadable ticks, stop affected dispatchers first. Preview with `ox_prune --purge-unreadable-ticks --schedule-key KEY --dry-run`, or use `--tick-pk PK` when the key cannot be read. Inspect the listed rows and the tasks those ticks recorded. Run without `--dry-run`, then restart dispatchers. Removal can repeat a tick or re-anchor a schedule and skip its next tick.
+
+Rolling back does not repair data; it runs the unchanged legacy timestamp rows again.
 
 ## Monitoring
 

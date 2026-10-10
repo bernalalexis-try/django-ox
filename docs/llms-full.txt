@@ -2207,10 +2207,21 @@ own, check that a backend's `OPTIONS` sets `SCHEDULE_SOURCE` to
 
 ## What a person with admin access can do
 
-They can pick a task from the list you exposed, set its timing and arguments,
-enable it, disable it, and run it once immediately. Disabling a readable row
-alone can pause it even if it no longer validates. This does not repair the row.
-Enabling it again is refused until it is corrected.
+They can pick an exposed task, set its timing and arguments, enable it, disable it, and run it once immediately. Disable can pause a row even when its stored values cannot be read or no longer validate. Pausing does not repair stored values. Enable and Run once refuse invalid rows, name them, and continue with the rest of the selection.
+
+The list keeps rows needing recovery in their positions and count, selectable by name or `pk N`. Timing shows "Stored values django-ox cannot use: {fields}"; an invalid enabled value shows "Invalid enabled value". Change and history pages show "Stored schedule needs recovery", with the primary key, name, task key, rejected fields, reasons and repair instructions. There is no form. Disable and Delete are available subject to permissions.
+
+Some rows keep their ordinary change, history and delete pages for users allowed to change them. Every unreadable value must be replaced by a form save, and Django must return it exactly as stored. Examples are SQLite text or fractions in integer timing fields, and MySQL `enabled = 2`. Unreadable timestamps and bytes in text columns always use recovery. The form warns about the values; a successful save replaces them and starts a fresh activation boundary.
+
+Disable pauses by primary key, tells workers and logs "Changed Enabled." Delete also works by primary key, tells workers and logs the deletion. Its confirmation identifies the schedule and explains that deletion does not require reading it. If a selected row disappears or becomes unauthorized before the write, the action counts it as skipped and continues with other rows.
+
+An unreadable newest tick displays "Unreadable tick history", never "never" or an older tick. The schedule can still be opened, edited, paused, enabled, run or deleted. Its change form, Enable and Run once warn that automatic dispatch may be blocked. They identify `ox_prune --purge-unreadable-ticks --schedule-key db:N`; follow the stop, preview, inspect and restart procedure under [Configuration](configuration.md#ox_prune).
+
+Times the active zone cannot display appear in UTC with a label, including after a timezone change. The form labels affected end-time inputs "End time (UTC)". Submitting an unchanged value preserves its instant; clearing it removes the end. If a save is refused after form validation, the error returns on the form without saving or logging a change. If the schedule was deleted meanwhile, Django reports that it does not exist.
+
+Schedule admin instances on the changelist and change form lack `get_queryset()` annotations, including `last_tick_at`. Adapt `list_display` and `readonly_fields` consumers before upgrading. Annotation ordering still selects the page.
+
+Fields named in subclass `fields` or `fieldsets` remain read-only for `start_time`, `created_at` and `updated_at`. Layouts built by an overridden `get_fieldsets()` are not inspected.
 
 Running one immediately ignores both the pause and the end time: a schedule
 that is disabled or past its `end_time` still runs.
@@ -2867,6 +2878,45 @@ Worth knowing before you turn it on:
   anything else in `transaction.on_commit`. A callback registered that way that
   raises, whatever it raises, is logged as `schedule_dispatch_callback_failed`;
   the task it followed is enqueued and counted.
+
+
+## Upgrade checks
+
+Before upgrading, check stored schedule boundaries and tick history if your application uses psycopg2 or mysqlclient. The reader now rejects PostgreSQL infinite timestamps and MySQL zero dates instead of decoding them as datetime endpoints or `None`. Those values cause schedules to be skipped. Use your actual table names; the queries use Django's defaults.
+
+With psycopg2, run these PostgreSQL checks for infinite values:
+
+```sql
+SELECT id FROM django_ox_oxschedule WHERE NOT isfinite(start_time) OR NOT isfinite(end_time);
+SELECT id FROM django_ox_oxscheduletick WHERE NOT isfinite(scheduled_for);
+```
+
+These PostgreSQL queries were validated on PostgreSQL 16 to identify infinite values.
+
+With mysqlclient, run these MySQL checks:
+
+```sql
+SELECT id FROM django_ox_oxschedule
+WHERE start_time IS NULL
+   OR CAST(start_time AS CHAR) REGEXP '(^0000-|^[0-9]{4}-00-|^[0-9]{4}-[0-9]{2}-00)'
+   OR CAST(end_time AS CHAR) REGEXP '(^0000-|^[0-9]{4}-00-|^[0-9]{4}-[0-9]{2}-00)'
+   OR DAY(start_time) > DAY(LAST_DAY(start_time))
+   OR DAY(end_time) > DAY(LAST_DAY(end_time));
+SELECT id FROM django_ox_oxscheduletick
+WHERE scheduled_for IS NULL
+   OR CAST(scheduled_for AS CHAR) REGEXP '(^0000-|^[0-9]{4}-00-|^[0-9]{4}-[0-9]{2}-00)'
+   OR DAY(scheduled_for) > DAY(LAST_DAY(scheduled_for));
+```
+
+These MySQL queries were validated on MySQL 8.4.11 with mysqlclient and PyMySQL, not on MySQL 8.0 or MariaDB.
+
+On SQLite, SQL-inserted bytes in text columns can cause schedules to be skipped. After upgrading, `schedule_row_skipped` identifies the row, `fields` and `reason`. These queries do not check SQLite. `ox_prune` keeps tick keys stored as bytes; removal requires `--tick-pk`.
+
+For an intended unbounded end, call `update_schedule(OxSchedule(pk=N), end_time=None)`. Replace an invalid start with an operator-chosen valid instant using SQL; do not treat it as absent.
+
+To remove unreadable ticks, stop affected dispatchers first. Preview with `ox_prune --purge-unreadable-ticks --schedule-key KEY --dry-run`, or use `--tick-pk PK` when the key cannot be read. Inspect the listed rows and the tasks those ticks recorded. Run without `--dry-run`, then restart dispatchers. Removal can repeat a tick or re-anchor a schedule and skip its next tick.
+
+Rolling back does not repair data; it runs the unchanged legacy timestamp rows again.
 
 ## Monitoring
 
@@ -5423,6 +5473,8 @@ wait as long as a connection stays open without answering. Statements
 elsewhere can also wait without limit. This change adds no shutdown
 deadline.
 
+The stored-schedule reader changed for psycopg2 and mysqlclient; follow the [upgrade checks](stored-schedules.md#upgrade-checks) before upgrading.
+
 `Worker.run_once()` and `testing.run_tasks()` raise the claim's original
 error at once, without an immediate recovery attempt or a pending recovery
 read on the next call. A claim that committed stays `RUNNING` and is left
@@ -7738,7 +7790,7 @@ A stopped reconciler sweep is not a completed sweep. Check `visited_count`, `unv
 | `schedule_dispatch_callback_failed` | WARNING | A `transaction.on_commit` callback registered by a `task_enqueued` receiver raised after the dispatch transaction committed. The task is enqueued, the tick is recorded and the dispatch is counted; the failure is the callback's. Carries `task_id`. |
 | `schedule_dispatch_failed` | WARNING | A dispatch pass was abandoned. `category=database` covers `django.db.Error`, including `InterfaceError`; `unexpected_exception` covers other unhandled exceptions. Failed rollback, a changed session or an unusable connection also abandons the pass. An unusable connection is dropped; claiming still runs. Dispatch is retried one schedule interval later. Each category gets a first traceback, then summaries at most once per minute. Carries `worker_id`, `database`, `category`, `error`, `failures` and `suppressed`. Marker reads and boundary heals retain their own events. |
 | `schedule_dispatch_resumed` | INFO | A dispatch pass completed after one or more abandoned passes. Logged once for the completed run of failures, covering both categories. Carries `worker_id`, `database` and `failures`, the total abandoned passes in that run. |
-| `schedule_tick_unreadable` | WARNING | A schedule was skipped this pass because a tick in its history holds a value that cannot be read. Schedule skipped; tick history was not treated as absent: no tick is recorded and no task is enqueued for it, and the other schedules in the pass are dispatched. `phase` is `latest` for the newest tick within the pass's bound, or `anchor` for the earliest tick, which decides a settings-declared schedule's first sighting. The schedule stays skipped until the tick is repaired or removed. Logged once, then at most one summary per 60 seconds per schedule per worker. Carries `schedule`, `schedule_key`, `schedule_pk`, `phase`, `reason`, `tick_pk`, `database`, `failures` and `suppressed`. `ox_prune` logs the same event, with `surface` set to `prune`, when it met a schedule tick row it cannot read and kept it: one record per row for the first 100 rows of a run, carrying `surface`, `database`, `schedule_key`, `tick_pk` and `reason`, then one record carrying `unlisted` for the rest. From `ox_prune` it is logged only where a log handler is configured; the same rows are listed on stderr either way. |
+| `schedule_tick_unreadable` | WARNING | Worker: Schedule skipped; tick history was not treated as absent. No tick or task is created for it; other schedules continue. `phase=latest` means the newest tick within the pass's bound; `anchor` means the earliest tick defining a settings schedule's first sighting. Repair or remove the unreadable tick. Logged once, then at most once a minute per schedule per worker. Carries `worker_id`, `database`, `schedule`, `schedule_key`, `schedule_pk`, `phase`, `reason`, `tick_pk`, `failures` and `suppressed`. Pruning: `surface=prune` reports preserved unreadable ticks, one record per row for the first 100, then a summary with `unlisted`. Row records carry `database`, `schedule_key`, `tick_pk` and `reason`. Logging requires a `django_ox` handler; stderr lists the rows regardless. Admin: `surface=admin`, `phase=latest` reports an unreadable newest tick on list and change pages, and after Enable or Run once. "Unreadable tick history" replaces the Last tick value, without falling back to an older tick. Carries `database`, `schedule_key`, `schedule_pk`, `tick_pk` and `reason`; logged once, then at most once a minute per schedule per web process. |
 | `schedule_tick_readable` | INFO | This worker read a schedule's tick history again after skipping it with `schedule_tick_unreadable`. Logged once per run of skipped passes. Carries `worker_id`, `schedule`, `schedule_key`, `schedule_pk`, `database` and `failures`, the number of skipped passes in that run. |
 | `schedule_tick_history_removed` | WARNING | `ox_prune --purge-unreadable-ticks` removed an unreadable tick row. Logged per row as each batch commits, with `database`, `schedule_key`, `tick_pk` and `reason`. Logging requires a `django_ox` handler; stdout lists removed rows regardless. Removing history can repeat a tick or cause re-anchoring that skips the next tick. |
 | `schedule_source_unavailable` | WARNING | The stored schedules or their change marker could not be read. A change marker holding a value that cannot be read is reported once, then at most once a minute while it remains unreadable. During that time, the worker reads the schedules in full at each reconcile interval instead of relying only on the last set it read. A database error on the marker read is reported on every dispatch pass while it lasts, and the worker keeps running on the last set it read. A database error during a full read stops the pass. A stream of this event right after a deploy can mean the code is running ahead of migration `0007`. |
@@ -7746,6 +7798,8 @@ A stopped reconciler sweep is not a completed sweep. Check `visited_count`, `unv
 | `schedule_boundary_healed` | INFO | A stored schedule's timing had changed without its activation boundary moving, so the boundary was moved onto the current timing. Expected after a bulk update; repeated for one schedule is not. |
 | `schedule_boundary_heal_failed` | WARNING | The database refused the boundary move. That schedule cannot dispatch while healing is pending; other schedules continue. Healing is retried every dispatch pass. The first warning includes a traceback; later warnings summarize at most once a minute per row per worker. Carries `schedule_pk`, `error`, `failures` and `suppressed`. Check database errors, constraints, triggers, permissions and locks. |
 | `schedule_unreadable_row_written` | INFO | Before this write, the schedule held a stored value django-ox could not use. `update_schedule`, including admin calls, paused or changed it. Carries `schedule_pk`, `database`, `operation` and `written_fields`. Logged on commit, never on rollback. Field names, not values, are recorded. Pausing does not establish that the stored values were repaired. |
+| `schedule_admin_row_unreadable` | WARNING | An admin page or action encountered a stored value django-ox cannot use. Carries `database`, `schedule`, `schedule_pk`, `fields` and `reason`. Use the identified fields and reason to choose repair, pause or deletion. Logged once, then at most once a minute per row per web process. |
+| `schedule_admin_datetime_fallback` | WARNING | The schedule admin showed a stored time in UTC because the active time zone cannot show it (an end late on 31 December 9999 east of UTC, a start early in year 1 west of it). Carries `field` and `zone`. At most once a minute per field and zone per web process. |
 | `worker_error` | ERROR | The execution wrapper itself raised (an internal worker error, not a task failure). A connection-level outcome-write failure whose recovery on a new connection also failed is reported as `task_outcome_unrecorded` instead. |
 | `worker_claim_released` | WARNING | A claim raised an error even though it had committed. This worker returned the row to `READY` and refunded 1 attempt. Includes `task_id`, `task_path`, `queue`, `attempt` after the refund, `worker_id`, `old_epoch`, `new_epoch`, `refunded_attempts` and `reason` set to `claim_outcome_unknown`. |
 | `worker_claim_recovery_failed` | WARNING | A recovery read could not run or finish while `Worker.run()` was stopping, including when another claim of the same Worker remained in flight past the five-second claim-wait budget or began during the look. Includes a traceback; the exception text identifies claim interference. `claim_recovery` is always `expired`: the worker is stopping without another recovery retry. Rows the look released before giving up are `READY`, each logged as `worker_claim_released`. Any unrecovered row is then left to the reaper. |
@@ -7855,8 +7909,8 @@ A failed connect while recording a stuck attempt logs
 | `refunded_attempts` | `worker_claim_released` | Number of attempts refunded by this release. Always 1. |
 | `attempts` | `worker_claim_release_refused` | The stored attempt count on the row whose release was refused. No attempt was refunded. |
 | `worker_ids` | `worker_claim_release_refused` | The stored worker-id history on the row whose release was refused. It must contain one entry per attempt and end with the recovering worker's id. |
-| `schedule` | `schedule_dispatched`, `schedule_row_skipped`, `schedule_dispatch_error`, `schedule_dispatch_recovered`, `schedule_dispatch_callback_failed`, `schedule_tick_dropped`, `schedule_tick_unreadable`, `schedule_tick_readable`, `schedule_lock_unavailable` for a settings-declared schedule | The schedule's name, from `SCHEDULES` or from its row. For `schedule_row_skipped`, this may be `None` if the row's name could not be read. |
-| `schedule_pk` | `schedule_row_skipped`, `schedule_lock_unavailable` for a stored schedule, `schedule_boundary_healed`, `schedule_boundary_heal_failed`, `schedule_tick_unreadable`, `schedule_tick_readable`, `schedule_unreadable_row_written` | The stored schedule's row id. Absent for a settings-declared schedule, which has no row; on `schedule_tick_unreadable` and `schedule_tick_readable` it is `None` for one. |
+| `schedule` | `schedule_dispatched`, `schedule_row_skipped`, `schedule_dispatch_error`, `schedule_dispatch_recovered`, `schedule_dispatch_callback_failed`, `schedule_tick_dropped`, `schedule_tick_unreadable`, `schedule_tick_readable`, `schedule_admin_row_unreadable`, `schedule_lock_unavailable` for a settings-declared schedule | Name from `SCHEDULES` or the stored row. Stored names escape control characters and are bounded to 200 characters. On `schedule_row_skipped` and `schedule_admin_row_unreadable`, an unreadable name may be `None`. |
+| `schedule_pk` | `schedule_row_skipped`, `schedule_lock_unavailable` for a stored schedule, `schedule_boundary_healed`, `schedule_boundary_heal_failed`, `schedule_tick_unreadable`, `schedule_tick_readable`, `schedule_unreadable_row_written`, `schedule_admin_row_unreadable` | The stored schedule's row id. Absent for a settings-declared schedule, which has no row; on `schedule_tick_unreadable` and `schedule_tick_readable` it is `None` for one. |
 | `scheduled_for`, `late_seconds` | `schedule_tick_dropped` | The tick that was dropped, and how late it was when the deadline rejected it. |
 | `reason` | `schedule_row_skipped` | Why a full or locked read rejected the row. Stored-value reasons name the field, quote its bounded value and explain the problem, including a maximum `boundary_generation`. Unregistered task keys are identified against this process's registry. |
 | `fields` | `schedule_row_skipped` | Fields rejected by the guarded reader, in model order, as a list. Includes a maximum `boundary_generation`. Empty for build failures, including unregistered task keys, or when the read cannot identify a field. |
@@ -7864,12 +7918,16 @@ A failed connect while recording a stuck attempt logs
 | `schedule_key` | `schedule_tick_unreadable`, `schedule_tick_readable`, `schedule_tick_history_removed` | Tick-history key: a settings schedule's name or `db:<pk>` for a stored schedule. Prune records escape control characters and bound it to 200 characters; an unreadable key is empty. |
 | `phase` | `schedule_tick_unreadable` | Worker: `latest` for the newest tick within the pass's bound; `anchor` for a settings schedule's earliest tick. Admin: always `latest`. Absent from prune records. |
 | `tick_pk` | `schedule_tick_unreadable`, `schedule_tick_history_removed` | Tick row's primary key. For worker `phase=latest`, looked up only when logging; `None` if missing or lookup fails. The schedule remains skipped either way. Anchor, admin and prune reads supply the key directly. |
-| `surface` | `schedule_tick_unreadable` | What met the unreadable tick row: `prune` for `ox_prune`. Absent on a worker's record. |
+| `surface` | `schedule_tick_unreadable` | What met the unreadable tick row: `prune` for `ox_prune`, `admin` for the schedule admin. Absent on a worker's record. |
 | `unlisted` | `schedule_tick_unreadable` | On the last record of an `ox_prune` run that kept more than 100 unreadable tick rows: how many of them were not named one by one. |
 | `category` | `schedule_dispatch_failed` | What abandoned the pass: `database` or `unexpected_exception`. |
 | `written_fields` | `schedule_unreadable_row_written` | The names of the fields the write set, sorted. |
 | `operation` | `schedule_unreadable_row_written` | `paused` for `enabled=False` alone; `changed` for any other update. |
-| `database` | `schedule_unreadable_row_written` | The database alias the schedule was written through. |
+| `database` | `schedule_unreadable_row_written`, `schedule_admin_row_unreadable` | The database alias the schedule is written through, which is the one the schedule admin reads. |
+| `fields` | `schedule_admin_row_unreadable` | Fields rejected by the guarded reader, as a list, including a maximum `boundary_generation`. Empty when the read cannot identify a field. |
+| `reason` | `schedule_admin_row_unreadable` | Why django-ox cannot use the stored values. Names rejected fields and their values, escaped and shortened, including a `boundary_generation` that has reached its column's maximum. |
+| `field` | `schedule_admin_datetime_fallback` | The time that was shown in UTC: `start_time`, `end_time`, `created_at` or `updated_at`. |
+| `zone` | `schedule_admin_datetime_fallback` | The active time zone that could not show it. |
 | `queues` | `worker_started` | The worker's queues. |
 | `concurrency` | `worker_started`, `connection_pool_too_small` | The worker's task-thread concurrency, set by `--concurrency`. |
 | `database` | `connection_pool_too_small`, `worker_connection_hint`, `schedule_dispatch_error`, `schedule_dispatch_failed`, `schedule_dispatch_resumed`, `schedule_dispatch_recovered`, `schedule_tick_unreadable`, `schedule_tick_readable`, `schedule_tick_history_removed` | Worker: `--database`, or the alias used to write `OxTask`. Prune: the alias the command worked on. Admin: the schedule's write alias. |
@@ -9098,7 +9156,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-**Upgrading:** No database migration is required.
+**Upgrading:** No database migration is required. Upgrade workers and
+application processes to apply stored-schedule authorization and
+unreadable-row handling across workers, the admin, `ox_prune` and the
+write API.
+
+Before upgrading, psycopg2 and mysqlclient users must check schedule
+boundaries and tick history with the queries under Compatibility.
+Some SQL-written values now cause schedules to be skipped.
+Review Compatibility before deployment.
+After upgrading, check `schedule_row_skipped`, `schedule_tick_unreadable`
+and `schedule_dispatch_failed`, and resolve the conditions they report.
 
 ### Upgrading earlier `oxpull` installs
 
@@ -9108,11 +9176,90 @@ Do not uninstall an earlier `oxpull` distribution after installing django-ox 1.9
 
 If the distributions were installed in the wrong order, remove any remaining earlier `oxpull` distribution and then force-reinstall django-ox. See [Earlier `oxpull` installs](https://oxpull.com/django-ox/migrating/#earlier-oxpull-installs) for the complete sequence and repair commands.
 
+### Fixed
+
+- Skip only the schedule affected by unreadable tick history, reporting
+  `schedule_tick_unreadable`. Do not treat that history as absent and
+  fire or anchor the schedule again. This also covers unreadable anchor
+  history for settings-declared schedules and repeated child restarts
+  under `--processes`.
+
+- Keep workers running after unexpected dispatch exceptions and retry
+  dispatch next pass. Handle `django.db.InterfaceError` with other
+  database errors, allowing the claim to run that pass.
+
+- Keep healthy schedules visible when another row cannot be read.
+  Show recovery pages for unreadable rows on change and history views;
+  allow authorized Disable and Delete operations. Related-object links
+  using `?_to_field=id` receive the same handling. This includes MySQL
+  zero dates with `USE_TZ = False`.
+
+- Keep admin views, actions and deletion working around unreadable tick
+  history. Show "Unreadable tick history" in Last tick. Show and edit
+  otherwise valid times in UTC when the active time zone cannot display
+  them. Show "Invalid enabled value" for MySQL `enabled = 2`.
+
+- Allow `update_schedule(OxSchedule(pk=pk), enabled=False)` to pause a
+  row holding a value that cannot be read. Pausing does not repair the
+  stored values. Repair writable unreadable fields together in one
+  `update_schedule` call, or save the admin form where one is available.
+  Replace values in fields only the package writes through SQL, or
+  pause or delete the schedule.
+
+- Return field-keyed `ValidationError` for non-numeric `every_seconds`
+  and `phase_seconds`. Allow admin corrections of SQLite text in those
+  fields and MySQL `enabled = 2`.
+
+- Return form errors when a locked write refuses a previously accepted
+  admin submission, without saving it. Handle concurrent deletion with
+  Django's missing-object response. This also works under
+  `ATOMIC_REQUESTS` on MySQL at REPEATABLE READ.
+
+- Let ordinary `ox_prune`, including `--dry-run`, complete around
+  unreadable ticks. Keep and report every unreadable tick and each
+  schedule's newest readable tick.
+
+- Skip and name SQLite rows with unreadable boundaries or invalid
+  `enabled` values instead of silently misreading them. Explain when a
+  task key is not registered in the process handling the read.
+
+- Allow admin Disable for a maximum `boundary_generation`; prevent
+  SQLite workers from converting that count to a float.
+
+- Handle SQLite names stored as bytes without breaking schedule admin
+  pages. Use `pk N` for `str(schedule)` when its name cannot be read as
+  text. This is display text only; the stored name is unchanged.
+
+- Escape stored schedule names before worker logging, so line breaks,
+  control characters and escape sequences cannot introduce log lines.
+
 ### Changed
 
 - The `oxpull` distribution on PyPI is now a metapackage at version 1.9.0.
   It supplies no Python module and depends on `django-ox>=1.9.0`.
   The django-ox distribution supplies the `oxpull` module.
+
+- Add `category=database` or `category=unexpected_exception` to
+  `schedule_dispatch_failed`. Emit `schedule_dispatch_resumed` at INFO
+  after a completed pass following abandoned passes.
+
+- Add stored-row diagnostics: `schedule_tick_readable`,
+  `schedule_tick_history_removed`, `schedule_unreadable_row_written`,
+  `schedule_admin_row_unreadable` and `schedule_admin_datetime_fallback`.
+  `fields` on `schedule_row_skipped` and `schedule_admin_row_unreadable`
+  identifies rejected fields, including a maximum `boundary_generation`;
+  it can be empty. `written_fields` on
+  `schedule_unreadable_row_written` lists fields set by the write,
+  sorted. It does not identify rejected fields.
+
+- Report `schedule_boundary_heal_failed` once in full, then at most once
+  a minute per row per worker, with `schedule_pk`, `error`, `failures`
+  and `suppressed`. Stored-value reasons now describe the value and
+  its problem. Match event names and keys rather than message text.
+
+- Start repaired schedules from the repair time, with a fresh activation
+  boundary and an incremented `boundary_generation`. Enable and
+  "Run selected schedules once now" name rows they leave unchanged.
 
 ### Added
 
@@ -9122,6 +9269,25 @@ If the distributions were installed in the wrong order, remove any remaining ear
     - Rate limiting.
     - Provisional workflows.
 - Include the app's five migrations and `py.typed` marker. No separate `oxpull` installation is needed to use the app.
+
+- Add `django_ox.exceptions.StoredValueUnreadable`, with `alias`,
+  `model`, `pk`, `fields` and `reason`; `__cause__` holds the original
+  error. It is not a `DatabaseError`.
+
+- Add optional `user=` to `delete_schedule(schedule, *, user=None)`.
+  Calls without `user` retain their previous behavior.
+
+- Add `ox_prune --purge-unreadable-ticks`, requiring at least one
+  repeatable `--schedule-key KEY` or `--tick-pk PK`. It cannot accompany
+  `--queue`, `--older-than` or `--include-failed`. Repaired rows are kept
+  after a locked re-read.
+
+  Stop workers dispatching the affected schedules. Run with `--dry-run`,
+  inspect the rows and tasks they recorded, then run without it and
+  restart workers. Removing history can repeat a tick or cause
+  re-anchoring that skips the next tick. On MySQL, key matching uses the
+  tick table's collation, including case-, accent- or trailing-space-
+  equivalent keys. Inspect the dry run or target individual primary keys.
 
 - Log `worker_connection_hint` once at INFO during `Worker.run()` startup
   on PostgreSQL without pooling and on MySQL when `CONN_MAX_AGE = 0`.
@@ -9146,6 +9312,98 @@ If the distributions were installed in the wrong order, remove any remaining ear
 - `oxpull.__version__` now equals `django_ox.__version__`.
 - The app's display name is now "Oxpull".
 - The `oxpull` app now enforces its existing Django 6.0+ requirement at load time, raising `ImproperlyConfigured` on Django 5.2; django-ox itself still installs there. The earlier separate `oxpull` 1.8.0 package already declared Django>=6.0 in its metadata. Apart from this load-time check, the app's runtime behavior is unchanged from `oxpull` 1.8.0. One configuration-error message has also been reworded.
+
+- Tick deletion through `ox_prune` no longer emits `pre_delete` or
+  `post_delete` for `OxScheduleTick`. Task deletion retains its signals.
+  Ordinary model deletion outside pruning is unchanged.
+
+- Catch `StoredValueUnreadable` for unreadable-row updates instead of
+  vendor `DataError`, SQLite `ValueError`/`OperationalError` or MySQL
+  `AttributeError`. Pausing such a row returns a deferred instance,
+  not the supplied instance. Accessing deferred fields uses Django's
+  ordinary read and can raise.
+
+- SQLite updates now refuse silently misread values with
+  `StoredValueUnreadable` unless the call replaces them. Examples are
+  `end_time='banana'` and `enabled=2`. Pause-only recovery remains
+  available.
+
+- Non-superuser staff cannot change, pause or delete schedules whose
+  stored key is unregistered in the handling process, including cleanup.
+  Use an active superuser or trusted application code without `user=`.
+
+- Workers running `ox_worker --batch` do not exit while dispatch stays
+  broken after unexpected dispatch exceptions, including custom
+  schedule source store failures. Batch wrappers need their own
+  time limit. The worker logs `schedule_dispatch_failed`; alert on
+  this event regardless of exit.
+  Clean termination does not establish successful dispatch.
+
+- A maximum `boundary_generation` now prevents dispatch and refuses
+  changes other than pausing with `StoredValueUnreadable`. The count
+  has reached its column's maximum and cannot increase. Lower it with
+  SQL, or delete the schedule and create it again. The API and admin
+  cannot lower the count. If SQL seeds one below maximum, a subsequent
+  heal or API retime succeeds at maximum; later reads skip the row.
+
+- SQL-inserted SQLite BLOB text values previously tolerated by workers
+  can now cause their schedule to be skipped. Tick keys stored as bytes
+  are kept by pruning and require `--tick-pk` for removal.
+
+- The reader uses one decoding policy across drivers. With psycopg2,
+  PostgreSQL `infinity` and `-infinity` no longer become datetime
+  endpoints. With mysqlclient, MySQL zero dates no longer become
+  `None`. Schedule boundaries or tick history containing these values
+  now cause skips. With psycopg 3 and PyMySQL, these rows already failed
+  in 1.8.0. Rolling back runs the unchanged rows again; it repairs
+  nothing.
+
+  Before upgrading, run these checks using your actual table names.
+  These are the defaults. PostgreSQL queries were validated on
+  PostgreSQL 16 and identify infinite values:
+
+  ```sql
+  SELECT id FROM django_ox_oxschedule WHERE NOT isfinite(start_time) OR NOT isfinite(end_time);
+  SELECT id FROM django_ox_oxscheduletick WHERE NOT isfinite(scheduled_for);
+  ```
+
+  These MySQL queries were validated on MySQL 8.4.11 with mysqlclient
+  and PyMySQL, not on MySQL 8.0 or MariaDB:
+
+  ```sql
+  SELECT id FROM django_ox_oxschedule
+  WHERE start_time IS NULL
+     OR CAST(start_time AS CHAR) REGEXP '(^0000-|^[0-9]{4}-00-|^[0-9]{4}-[0-9]{2}-00)'
+     OR CAST(end_time AS CHAR) REGEXP '(^0000-|^[0-9]{4}-00-|^[0-9]{4}-[0-9]{2}-00)'
+     OR DAY(start_time) > DAY(LAST_DAY(start_time))
+     OR DAY(end_time) > DAY(LAST_DAY(end_time));
+  SELECT id FROM django_ox_oxscheduletick
+  WHERE scheduled_for IS NULL
+     OR CAST(scheduled_for AS CHAR) REGEXP '(^0000-|^[0-9]{4}-00-|^[0-9]{4}-[0-9]{2}-00)'
+     OR DAY(scheduled_for) > DAY(LAST_DAY(scheduled_for));
+  ```
+
+  For an intended unbounded end, use
+  `update_schedule(OxSchedule(pk=N), end_time=None)`. Replace invalid
+  starts with valid times you choose. Preview unreadable-tick removal
+  before purging, following the procedure above.
+
+- Stored schedule reads consume more CPU than 1.8.0; full reconciles
+  issue batched queries. Dispatch statement counts are unchanged.
+  `ox_prune` also uses more client CPU (about 3x on PostgreSQL in our
+  tests) to keep and report unreadable ticks without aborting pruning.
+  It uses fewer database round trips and was faster in our network
+  tests, though slower with local database servers.
+
+- Schedule admin display instances are reconstructed. Annotations from
+  `get_queryset()` do not reach `list_display` methods or
+  `readonly_fields` on the changelist or change form. Adapt annotation
+  consumers; `last_tick_at` is also unavailable. Annotation ordering
+  can still select the page.
+
+- Database-raised read errors propagate unchanged. Inside a caller's
+  transaction, stored-schedule reads no longer recover through a
+  savepoint; the caller must roll back.
 
 - Default connection lifecycle, transaction, delivery and schema semantics
   are unchanged. Persistence and pooling remain opt-in.

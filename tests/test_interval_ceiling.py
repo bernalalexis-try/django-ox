@@ -714,7 +714,10 @@ class TestARowAlreadyInTheTable:
             follow=True,
         )
         said = [str(message) for message in response.context["messages"]]
-        assert "Skipped 1 schedule(s) that cannot run as written." in said
+        assert (
+            "Skipped 1 schedule(s) that cannot run as written: "
+            f"too-long (pk {row.pk})." in said
+        )
         assert "Enqueued 0 task(s)." in said
         assert not OxTask.objects.exists()
 

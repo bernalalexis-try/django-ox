@@ -390,7 +390,10 @@ class TestRunOnceNowSaysWhatItRan:
         response = self._run(client, [broken.pk])
         messages = [str(m) for m in response.context["messages"]]
         assert "Enqueued 0 task(s)." in messages
-        assert "Skipped 1 schedule(s) that cannot run as written." in messages
+        assert (
+            "Skipped 1 schedule(s) that cannot run as written: "
+            f"broken (pk {broken.pk})." in messages
+        )
         assert not any("ignores both" in m for m in messages)
 
     def test_the_end_time_is_on_the_changelist_where_rows_are_selected(
@@ -432,7 +435,11 @@ class TestRunOnceNowReportsAPermissionRefusal:
         response = self._post(client, "run_once_now", [row.pk])
         messages = [str(m) for m in response.context["messages"]]
         assert "Enqueued 0 task(s)." in messages
-        assert "Skipped 1 schedule(s) you do not have permission to change." in messages
+        assert (
+            "Skipped 1 schedule(s) you do not have permission to change. If a task_key "
+            "cannot be read or isn't registered here, only an active superuser can "
+            "change its schedule."
+        ) in messages
         assert OxTask.objects.count() == 0
 
     def test_the_wording_is_the_one_the_sibling_action_already_uses(
@@ -462,13 +469,17 @@ class TestRunOnceNowReportsAPermissionRefusal:
         response = self._post(client, "run_once_now", [allowed.pk, refused.pk])
         messages = [str(m) for m in response.context["messages"]]
         assert "Enqueued 1 task(s)." in messages
-        assert "Skipped 1 schedule(s) you do not have permission to change." in messages
+        assert (
+            "Skipped 1 schedule(s) you do not have permission to change. If a task_key "
+            "cannot be read or isn't registered here, only an active superuser can "
+            "change its schedule."
+        ) in messages
         assert OxTask.objects.count() == 1
 
     def test_a_broken_row_is_still_reported_as_broken(self, client, admin_user):
         # The other branch keeps its own wording: a superuser is refused
         # nothing, and telling them a row is unrunnable is the true report.
-        OxSchedule.objects.create(
+        broken = OxSchedule.objects.create(
             name="broken",
             task_key="report",
             trigger="cron",
@@ -478,11 +489,12 @@ class TestRunOnceNowReportsAPermissionRefusal:
             updated_at=timezone.now(),
         )
         client.force_login(admin_user)
-        response = self._post(
-            client, "run_once_now", [OxSchedule.objects.get(name="broken").pk]
-        )
+        response = self._post(client, "run_once_now", [broken.pk])
         messages = [str(m) for m in response.context["messages"]]
-        assert "Skipped 1 schedule(s) that cannot run as written." in messages
+        assert (
+            "Skipped 1 schedule(s) that cannot run as written: "
+            f"broken (pk {broken.pk})." in messages
+        )
         assert not any("permission" in m for m in messages)
 
 
@@ -1110,10 +1122,9 @@ class TestDeletingThroughTheAdminTellsTheWorkers:
 
 class TestTheLastTickColumnReadsItsRow:
     """
-    The Last tick column used to look the newest tick up once per listed
-    schedule. The page already has the schedules, so the column now reads
-    an annotation get_queryset adds, and the page's statement count does
-    not move with the number of rows.
+    The Last tick column reads the newest tick of every listed schedule in
+    one statement, so the page's statement count does not move with the
+    number of rows.
     """
 
     def _tick(self, row, at=None):
@@ -1141,8 +1152,8 @@ class TestTheLastTickColumnReadsItsRow:
         assert ">never<" in body
 
     def test_the_newest_of_several_ticks_is_the_one_shown(self, client, admin_user):
-        # One tick per schedule cannot tell newest from oldest, so the
-        # ordering inside the subquery is only held here.
+        # One tick per schedule cannot tell newest from oldest, so that it
+        # is the newest the column reads is only held here.
         ran = a_schedule(name="ran")
         old = self._tick(ran, timezone.now() - timedelta(days=3))
         new = self._tick(ran, timezone.now() - timedelta(hours=1))

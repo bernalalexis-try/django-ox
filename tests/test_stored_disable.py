@@ -271,7 +271,7 @@ class TestTheAdminActions:
         assert response.status_code == 200
         assert self._said(response) == [
             "Enabled 1 schedule(s).",
-            _COULD_NOT_ENABLE.format(count=1),
+            _COULD_NOT_ENABLE.format(count=1, rows=f"{broken.name} (pk {broken.pk})"),
         ]
         assert OxSchedule.objects.get(pk=valid.pk).enabled is True
         assert OxSchedule.objects.get(pk=broken.pk).enabled is False
