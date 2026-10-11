@@ -5,12 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.9.0] - 2026-10-12
 
-**Upgrading:** No database migration is required. Upgrade workers and
-application processes to apply stored-schedule authorization and
-unreadable-row handling across workers, the admin, `ox_prune` and the
-write API.
+**Upgrading:** No database migration is required.
+Stored-schedule authorization and unreadable-row handling apply across
+workers, the admin, `ox_prune` and the write API. Upgrade workers to
+1.9.0; application-process upgrade guidance is under Security.
 
 Before upgrading, psycopg2 and mysqlclient users must check schedule
 boundaries and tick history with the queries under Compatibility.
@@ -26,6 +26,40 @@ If you installed `oxpull` separately, stop the affected processes and back up th
 Do not uninstall an earlier `oxpull` distribution after installing django-ox 1.9.0 as a standalone cleanup step: its uninstall record can delete files now supplied by django-ox. The module-free 1.9.0 metapackage does not have that behavior.
 
 If the distributions were installed in the wrong order, remove any remaining earlier `oxpull` distribution and then force-reinstall django-ox. See [Earlier `oxpull` installs](https://oxpull.com/django-ox/migrating/#earlier-oxpull-installs) for the complete sequence and repair commands.
+
+### Security
+
+- 1.9.0 fixes schedule permission checks affecting versions 1.2.0
+  through 1.8.0. This issue is Low severity. Access requires an
+  application exposing `update_schedule` with `user=`, or authenticated
+  staff access with schedule admin model permissions.
+
+- A user could retarget a guarded schedule to an entry they could use,
+  then pause it. An unregistered stored key also bypassed the entry's
+  permission check. These paths do not give ordinary anonymous users
+  schedule access.
+
+- Both paths were reproduced for each release on SQLite, Django 6.1.1
+  and Python 3.14.6. These runs cover that environment rather than each
+  release's support matrix. Admin deletion succeeded throughout the
+  affected range. Admin Disable succeeded on 1.8.0; earlier releases
+  returned HTTP 500.
+
+- Source inspection confirms the affected checks throughout the range
+  and their shared logic across database engines.
+
+- With `user=`, `update_schedule` authorizes the stored row under its
+  lock before applying changes, then authorizes the validated result
+  before writing. An unreadable or unregistered stored key requires an
+  active superuser for changes or deletion when `user=` is supplied.
+  The admin applies this rule to its pages, actions and both delete
+  routes.
+
+- See the [security advisory][schedule-permission-advisory] for these
+  changes. Upgrade application processes to 1.9.0 and review access to
+  the write API and schedule model permissions.
+
+[schedule-permission-advisory]: https://github.com/oxpull/django-ox/security/advisories/GHSA-mw49-53pm-wrvf
 
 ### Fixed
 
@@ -2384,6 +2418,7 @@ Initial release.
   the public API surface, the pre-1.0 SemVer rule, the deprecation
   window, and the supported Python and Django matrix.
 
+[1.9.0]: https://github.com/oxpull/django-ox/compare/v1.8.0...v1.9.0
 [1.7.0]: https://github.com/oxpull/django-ox/compare/v1.6.0...v1.7.0
 [1.8.0]: https://github.com/oxpull/django-ox/compare/v1.7.0...v1.8.0
 [1.6.0]: https://github.com/oxpull/django-ox/compare/v1.5.0...v1.6.0

@@ -8598,8 +8598,8 @@ process that shares a database before anything writes the new status. The
 release notes name the value, say how it reads through `django.tasks`, and
 give the upgrade and rollback steps.
 
-Pin accordingly: `django-ox~=1.8.0` accepts patch releases only;
-`django-ox~=1.3` accepts the current major line.
+Pin accordingly: `django-ox~=1.9.0` accepts patch releases only;
+`django-ox~=1.9` accepts the current major line.
 
 ## Deprecation policy
 
@@ -8824,6 +8824,66 @@ Unique tasks use `@unique` or `OPTIONS["UNIQUE_TASKS"]`. Batches require a recon
 For rate limits or workflows, set that alias's `OPTIONS["WORKER_CLASS"]` to `"oxpull.worker.OxpullWorker"`. Rate limits also need `OPTIONS["RATE_LIMITS"]`. Workflows also need `OPTIONS["WORKFLOWS"] = True` and a reconciler schedule.
 
 Follow the [feature setup](features/index.md) and the relevant feature page. Do not treat the backend or worker setting alone as complete configuration.
+
+## Upgrade to 1.9.0
+
+django-ox now includes the optional `oxpull` app under BSD-3-Clause:
+unique tasks, batches, rate limiting and provisional workflows, all
+free and open source. No separate `oxpull` installation is needed.
+
+Before rolling out the upgrade:
+
+- **Check the optional app's Django requirement.** It requires Django
+  6.0+. Enabling it or importing its runtime entry points on Django 5.2
+  raises `ImproperlyConfigured`. django-ox still supports Django 5.2
+  through `django-tasks`; projects not enabling the app do not load it.
+  Follow the [feature setup](features/index.md), including worker,
+  option and reconciler requirements.
+- **Existing django-ox users need no database migration for this
+  upgrade.** The optional app includes its five migrations.
+- **Handle earlier `oxpull` installations before upgrading django-ox.**
+  Stop affected processes and back up the database. Uninstall the
+  earlier distribution, upgrade django-ox, run migrations and restart.
+  Do not uninstall the earlier distribution after installing django-ox
+  1.9.0 as standalone cleanup: its uninstall record can delete files
+  now supplied by django-ox. If installed in the wrong order, remove
+  any remaining earlier distribution and force-reinstall django-ox.
+  Follow the [complete sequence and repair commands][earlier-installs].
+- **Apply the Low-severity schedule permission fix.** Versions 1.2.0
+  through 1.8.0 are affected by [GHSA-mw49-53pm-wrvf][permission-advisory].
+  Access requires an application exposing `update_schedule` with
+  `user=`, or authenticated staff with schedule admin model permissions.
+  These paths do not give ordinary anonymous users schedule access.
+- **Upgrade workers and application processes.** With `user=`,
+  `update_schedule` authorizes the stored row under lock before changes,
+  then the validated result before writing. Changes or deletion with
+  unreadable or unregistered stored keys require an active superuser.
+  The admin applies this rule to pages, actions and both delete routes.
+  Review write API access and schedule model permissions.
+- **Check stored values before deployment.** psycopg2 and mysqlclient
+  users must run the boundary and tick-history checks in the
+  [changelog's Compatibility section](changelog.md). PostgreSQL infinite
+  timestamps and MySQL zero dates now cause skips with those drivers.
+  Rolling back can run unchanged rows again; it does not repair them.
+- **Review recovery and operational changes.** Catch
+  `django_ox.exceptions.StoredValueUnreadable` for unreadable-row
+  updates. Pausing does not repair stored values. Ordinary `ox_prune`
+  keeps unreadable ticks; targeted purging needs a dry run and stopped
+  workers dispatching the affected schedules. Follow the changelog's
+  procedure before removing history.
+- **Check logs after upgrading.** Resolve `schedule_row_skipped`,
+  `schedule_tick_unreadable` and `schedule_dispatch_failed` conditions.
+  Unexpected dispatch exceptions are retried on the next pass.
+  `ox_worker --batch` does not exit while dispatch remains broken, so
+  batch wrappers need their own time limit. Clean termination does not
+  establish successful dispatch.
+
+Read the [1.9.0 changelog](changelog.md) for the full compatibility notes.
+Settings, import paths, task data, the optional app's label, table names,
+five migrations and persisted task paths are unchanged.
+
+[earlier-installs]: https://oxpull.com/django-ox/migrating/#earlier-oxpull-installs
+[permission-advisory]: https://github.com/oxpull/django-ox/security/advisories/GHSA-mw49-53pm-wrvf
 
 ## Upgrade to 1.8.0
 
@@ -9129,8 +9189,8 @@ Use Context7 library id `/oxpull/django-ox` to look up the documentation.
 
 ## Links
 
-- [Changelog](changelog.md): django-ox 1.8.0 and earlier releases.
-- [1.8.0 release notes](https://github.com/oxpull/django-ox/releases/tag/v1.8.0).
+- [Changelog](changelog.md): django-ox 1.9.0 and earlier releases.
+- [1.9.0 release notes](https://github.com/oxpull/django-ox/releases/tag/v1.9.0).
 - [Schedules in the database](stored-schedules.md):
   admin-editable schedules, `create_schedules` and the django-celery-beat
   database importer.
@@ -9154,12 +9214,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.9.0] - 2026-10-12
 
-**Upgrading:** No database migration is required. Upgrade workers and
-application processes to apply stored-schedule authorization and
-unreadable-row handling across workers, the admin, `ox_prune` and the
-write API.
+**Upgrading:** No database migration is required.
+Stored-schedule authorization and unreadable-row handling apply across
+workers, the admin, `ox_prune` and the write API. Upgrade workers to
+1.9.0; application-process upgrade guidance is under Security.
 
 Before upgrading, psycopg2 and mysqlclient users must check schedule
 boundaries and tick history with the queries under Compatibility.
@@ -9175,6 +9235,40 @@ If you installed `oxpull` separately, stop the affected processes and back up th
 Do not uninstall an earlier `oxpull` distribution after installing django-ox 1.9.0 as a standalone cleanup step: its uninstall record can delete files now supplied by django-ox. The module-free 1.9.0 metapackage does not have that behavior.
 
 If the distributions were installed in the wrong order, remove any remaining earlier `oxpull` distribution and then force-reinstall django-ox. See [Earlier `oxpull` installs](https://oxpull.com/django-ox/migrating/#earlier-oxpull-installs) for the complete sequence and repair commands.
+
+### Security
+
+- 1.9.0 fixes schedule permission checks affecting versions 1.2.0
+  through 1.8.0. This issue is Low severity. Access requires an
+  application exposing `update_schedule` with `user=`, or authenticated
+  staff access with schedule admin model permissions.
+
+- A user could retarget a guarded schedule to an entry they could use,
+  then pause it. An unregistered stored key also bypassed the entry's
+  permission check. These paths do not give ordinary anonymous users
+  schedule access.
+
+- Both paths were reproduced for each release on SQLite, Django 6.1.1
+  and Python 3.14.6. These runs cover that environment rather than each
+  release's support matrix. Admin deletion succeeded throughout the
+  affected range. Admin Disable succeeded on 1.8.0; earlier releases
+  returned HTTP 500.
+
+- Source inspection confirms the affected checks throughout the range
+  and their shared logic across database engines.
+
+- With `user=`, `update_schedule` authorizes the stored row under its
+  lock before applying changes, then authorizes the validated result
+  before writing. An unreadable or unregistered stored key requires an
+  active superuser for changes or deletion when `user=` is supplied.
+  The admin applies this rule to its pages, actions and both delete
+  routes.
+
+- See the [security advisory][schedule-permission-advisory] for these
+  changes. Upgrade application processes to 1.9.0 and review access to
+  the write API and schedule model permissions.
+
+[schedule-permission-advisory]: https://github.com/oxpull/django-ox/security/advisories/GHSA-mw49-53pm-wrvf
 
 ### Fixed
 
@@ -11533,6 +11627,7 @@ Initial release.
   the public API surface, the pre-1.0 SemVer rule, the deprecation
   window, and the supported Python and Django matrix.
 
+[1.9.0]: https://github.com/oxpull/django-ox/compare/v1.8.0...v1.9.0
 [1.7.0]: https://github.com/oxpull/django-ox/compare/v1.6.0...v1.7.0
 [1.8.0]: https://github.com/oxpull/django-ox/compare/v1.7.0...v1.8.0
 [1.6.0]: https://github.com/oxpull/django-ox/compare/v1.5.0...v1.6.0
