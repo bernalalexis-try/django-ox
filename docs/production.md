@@ -360,6 +360,8 @@ applies: the path must resolve to a django.tasks Task. Every path that fails
 is reported with its row count and exception class, and the command exits 1.
 `--queue` and `--database` scope the read as for the other database checks.
 Importing a task module runs the same import side effects as worker startup.
+Keep import-time output out of task modules: anything they print at import
+lands on stdout ahead of the `--format json` object.
 
 ## Running as a job
 
@@ -467,11 +469,12 @@ a task thread that its timeout could not stop; see
 
 This maps directly onto rolling deploys: install the new code, run `migrate`,
 run `ox_health --task-paths`, then roll workers by sending SIGTERM, waiting,
-and starting the new version. Set the process manager's kill escalation (`TimeoutStopSec` above)
-relative to your longest task, while allowing for calls that may not return.
-One caveat for the upgrade from 1.1.0, in the changelog under the 1.2.0
-migration note: a settings schedule first seen while both versions are
-running can be anchored twice, and its second tick does not fire.
+and starting the new version. Set the process manager's kill escalation
+(`TimeoutStopSec` above) relative to your longest task, while allowing for
+calls that may not return. One caveat for the upgrade from 1.1.0, in the
+changelog under the 1.2.0 migration note: a settings schedule first seen
+while both versions are running can be anchored twice, and its second tick
+does not fire.
 
 With `--processes` above 1, the signal goes to the supervisor, and SIGHUP
 counts as well as SIGTERM and SIGINT. The sequence is:

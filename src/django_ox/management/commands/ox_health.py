@@ -109,6 +109,8 @@ class Command(DatabaseCommand):
         parser.add_argument(
             "--task-paths",
             action="store_true",
+            # None, not False: _DATABASE_OPTIONS reads `is not None` to tell
+            # a flag that was typed from one that was not.
             default=None,
             help=(
                 "Fail when a READY or WAITING task's task_path no longer "
@@ -290,9 +292,11 @@ class Command(DatabaseCommand):
         if options["task_paths"]:
             unknown_task_paths = _unknown_task_paths(pending_paths)
             for unknown in unknown_task_paths:
+                rows = unknown["rows"]
                 problems.append(
                     f"task path {unknown['task_path']!r} does not resolve to a "
-                    f"task ({unknown['rows']} queued rows, {unknown['error']})"
+                    f"task ({rows} queued {'row' if rows == 1 else 'rows'}, "
+                    f"{unknown['error']})"
                 )
         if as_json:
             # A monitoring agent wants the figures most when a check fails, so
@@ -395,8 +399,9 @@ class Command(DatabaseCommand):
 def _pending_task_paths(queue: str | None, alias: str) -> dict[str, int]:
     """
     Each distinct task_path among the READY and WAITING rows, with its row
-    count, in one grouped query. The work grows with the number of distinct
-    paths, not with the backlog.
+    count. One grouped query whatever the backlog; like the other ox_health
+    reads, it visits every matching row, and only the imports that follow
+    scale with the number of distinct paths.
     """
     rows = OxTask.objects.using(alias).filter(status__in=_PENDING_STATUSES)
     if queue is not None:
@@ -413,15 +418,20 @@ def _unknown_task_paths(pending_paths: dict[str, int]) -> list[dict[str, Any]]:
     """
     The paths a worker would refuse, with the class of what went wrong.
 
-    Any exception counts, not only ImportError: a task module that raises
-    while it is imported fails the worker the same way. Only the class is
-    reported, so no traceback reaches stdout.
+    Anything the import raises counts, not only ImportError: a task module
+    that raises, or calls sys.exit(), while it is imported fails the worker
+    the same way. A SystemExit let through here would end the probe with the
+    module's exit code and no output, and exit 0 reads as healthy. Only
+    KeyboardInterrupt propagates; it is aimed at this process by whoever runs
+    it. Only the class is reported, so no traceback reaches stdout.
     """
     unknown: list[dict[str, Any]] = []
     for task_path, rows in pending_paths.items():
         try:
             resolve_task_path(task_path)
-        except Exception as exc:
+        except KeyboardInterrupt:
+            raise
+        except BaseException as exc:
             unknown.append(
                 {"task_path": task_path, "rows": rows, "error": type(exc).__name__}
             )
