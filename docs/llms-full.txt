@@ -1505,9 +1505,10 @@ not get those updates merely by accepting `heartbeat_file`.
 
 Finished task rows stay in the table until pruned; the queue table doubles
 as the result store, and django-ox does not guess at your retention
-needs. Run `ox_prune` on your own schedule (cron or a systemd timer;
-there is an example unit on the [Production](production.md#pruning-on-a-timer)
-page):
+needs. Run `ox_prune` on your own schedule (cron, a systemd timer, or the
+`django_ox.maintenance.prune` task in `SCHEDULES`; the
+[Production](production.md#pruning-on-a-timer) page shows the systemd unit
+and the schedule entry):
 
 ```
 python manage.py ox_prune --older-than 7d
@@ -4433,11 +4434,20 @@ than across queues. List every queue you use in the backend's `QUEUES`, or set
 Nothing extra to run: the workers you already have dispatch the ticks. Details
 in [Recurring tasks](recurring-tasks.md).
 
-Task rows are not deleted for you. Run `ox_prune` on your own schedule, from
-cron, a systemd timer, or a django-ox schedule:
+Task rows are not deleted for you. Run `ox_prune --older-than 7d` from cron
+or a systemd timer, or schedule the `django_ox.maintenance.prune` task,
+which runs `ox_prune` for you and returns its counts:
 
-```
-python manage.py ox_prune --older-than 7d
+```python
+"OPTIONS": {
+    "SCHEDULES": {
+        "ox-prune": {
+            "task": "django_ox.maintenance.prune",
+            "cron": "0 3 * * *",
+            "kwargs": {"older_than": "7d"},
+        },
+    },
+}
 ```
 
 ## Make a task safe to run twice
@@ -7033,11 +7043,33 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-Or from cron, or as a recurring task pointed at a small wrapper task of
-your own. Flag reference on the
-[Configuration](configuration.md#ox_prune) page. FAILED rows are kept by
-default so tracebacks survive until you have looked at them; add
-`--include-failed` once that is not needed.
+Or from cron, or as a django-ox schedule pointed at
+`django_ox.maintenance.prune`, which runs `ox_prune` for you:
+
+```python
+"SCHEDULES": {
+    "ox-prune": {
+        "task": "django_ox.maintenance.prune",
+        "cron": "0 3 * * *",
+        "kwargs": {"older_than": "7d"},
+    },
+}
+```
+
+The task takes `older_than`, `include_failed`, `queue`, `dry_run` and
+`batch_size`, the keyword forms of the `ox_prune` flags of the same name,
+with the command's defaults: seven days, FAILED and LOST rows kept, every
+queue, a real run, 1000 rows per DELETE. It returns the object
+`ox_prune --format json` prints, so each run's counts are kept on its
+task row. It prunes the alias `OxTask` writes to, as `ox_prune` does
+without `--database`; a worker started with `--database` for another
+alias doesn't change that. To prune another alias, run
+`ox_prune --database ALIAS` from cron or a timer.
+
+Flag reference on the [Configuration](configuration.md#ox_prune) page.
+FAILED rows are kept by default so tracebacks survive until you have
+looked at them; add `include_failed=True`, or `--include-failed` on the
+command line, once that is not needed.
 
 ### oxpull_prune
 
@@ -9143,6 +9175,12 @@ and [earlier security advisory](https://github.com/oxpull/django-ox/security/adv
   GHSA-gq8r-4ccg-vxcr, affecting 1.2.0 through 1.7.0.
 - `ox_prune --older-than 7d` deletes finished rows; FAILED rows stay unless
   `--include-failed`. READY, WAITING and RUNNING rows are never deleted.
+- `django_ox.maintenance.prune` is a task that runs `ox_prune` with
+  `--format json` and returns its counts. Its keywords `older_than`,
+  `include_failed`, `queue`, `dry_run` and `batch_size` map to the flags of
+  the same name. Schedule it in `OPTIONS["SCHEDULES"]`. It prunes the alias
+  `OxTask` writes to, whatever `--database` the worker running it was
+  started with; prune another alias with `ox_prune --database` from cron.
 - For per-container loop-liveness, pair `ox_worker --heartbeat-file PATH`
   with `ox_health --heartbeat-file PATH --processes N`, matching the
   worker's process count. Use an absolute path in an existing, writable
@@ -9300,6 +9338,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- `django_ox.maintenance.prune`, a task that runs `ox_prune --format json`
+  and returns its counts, so retention can be scheduled from
+  `OPTIONS["SCHEDULES"]` instead of an external timer. Its keywords
+  `older_than`, `include_failed`, `queue`, `dry_run` and `batch_size` map
+  to the flags of the same name, with the same defaults. It prunes the
+  alias `OxTask` writes to, as `ox_prune` does without `--database`.
 
 ## [1.9.1] - 2026-10-17
 
@@ -11738,6 +11787,7 @@ Initial release.
   the public API surface, the pre-1.0 SemVer rule, the deprecation
   window, and the supported Python and Django matrix.
 
+[Unreleased]: https://github.com/oxpull/django-ox/compare/v1.9.1...HEAD
 [1.9.1]: https://github.com/oxpull/django-ox/compare/v1.9.0...v1.9.1
 [1.9.0]: https://github.com/oxpull/django-ox/compare/v1.8.0...v1.9.0
 [1.7.0]: https://github.com/oxpull/django-ox/compare/v1.6.0...v1.7.0

@@ -1654,11 +1654,33 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-Or from cron, or as a recurring task pointed at a small wrapper task of
-your own. Flag reference on the
-[Configuration](configuration.md#ox_prune) page. FAILED rows are kept by
-default so tracebacks survive until you have looked at them; add
-`--include-failed` once that is not needed.
+Or from cron, or as a django-ox schedule pointed at
+`django_ox.maintenance.prune`, which runs `ox_prune` for you:
+
+```python
+"SCHEDULES": {
+    "ox-prune": {
+        "task": "django_ox.maintenance.prune",
+        "cron": "0 3 * * *",
+        "kwargs": {"older_than": "7d"},
+    },
+}
+```
+
+The task takes `older_than`, `include_failed`, `queue`, `dry_run` and
+`batch_size`, the keyword forms of the `ox_prune` flags of the same name,
+with the command's defaults: seven days, FAILED and LOST rows kept, every
+queue, a real run, 1000 rows per DELETE. It returns the object
+`ox_prune --format json` prints, so each run's counts are kept on its
+task row. It prunes the alias `OxTask` writes to, as `ox_prune` does
+without `--database`; a worker started with `--database` for another
+alias doesn't change that. To prune another alias, run
+`ox_prune --database ALIAS` from cron or a timer.
+
+Flag reference on the [Configuration](configuration.md#ox_prune) page.
+FAILED rows are kept by default so tracebacks survive until you have
+looked at them; add `include_failed=True`, or `--include-failed` on the
+command line, once that is not needed.
 
 ### oxpull_prune
 
